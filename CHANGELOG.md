@@ -3,6 +3,42 @@
 All notable changes to this project are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] — Sprint 3: connector abstraction & cleanup
+
+Pure structural refactor — **no functional behavior change**, guarded by the existing test
+suite. Goal: one coherent connector contract so the upcoming dashboard (Sprint 2) builds on a
+clean provider layer. See `docs/sprint-3-connectors.md`.
+
+### Changed
+- **Clean-architecture boundary enforced**: `musicsync/application` no longer imports
+  `musicsync/infrastructure`. `write_review` was promoted to the `LibraryProvider` port; the
+  concrete `SpotifyProvider` import + `isinstance` check are gone. A new architecture test
+  (`tests/test_architecture.py`, AST-based) fails the build if the boundary is ever violated.
+- **Adding a platform is now cheap**: single `PLATFORMS` tuple in the domain
+  (`musicsync/domain/platforms.py`); the apply dispatch is a data-driven loop; per-platform
+  graceful-degradation is a `graceful_on_apply_error` flag on the port instead of a
+  name check. No `if platform == …` branches remain in the apply path.
+- Shared helpers extracted (plain functions, no new class hierarchy): `infrastructure/_env.py`
+  (`load_env_keys`, each provider keeps its own missing-key policy), `domain/_time.py`
+  (`utc_now_iso`). Duplicated platform tuples, time helpers, and output-path constants removed.
+- Output paths consolidated in `application/output_paths.py` and **anchored to the project
+  root** (previously CWD-relative) — files now land in the same place regardless of the working
+  directory. Providers receive their paths by injection; the CWD-relative defaults are gone.
+
+### Security
+- **Tidal token cache written atomically and private from creation** (`tempfile.mkstemp` +
+  `chmod 0600` + `os.replace`), closing the brief world-readable window between `write_text`
+  and `chmod` in the previous implementation.
+- `_RedirectHandler` OAuth `code`/`state` moved off shared class-level attributes into a
+  per-call holder; `load_env_keys` asserts an absolute `base_dir` (fails loud on misuse).
+
+### Deferred (with trigger)
+- Read-side graceful skip still name-checks `provider.name == "tidal"` (pre-existing). Trigger:
+  when a 4th platform needs graceful read degradation → generalize to a `graceful_on_error`
+  flag and a platform-neutral log message.
+- Apple `apply_likes` marks tracks synced even if `mark_loved.applescript` fails. Trigger: if
+  "loved" flags go missing despite a clean run → propagate the AppleScript failure.
+
 ## [Unreleased] — Sprint 1: Tidal + SQLite library
 
 ### Added

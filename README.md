@@ -166,12 +166,13 @@ permisos de Automatización (Música). Las siguientes son silenciosas e incremen
   cuándo se sincronizó). Sustituye a `state.json`, que se **migra automáticamente** una sola vez.
 - Inspecciónala con cualquier cliente SQLite, o expórtala con `--export`.
 
-**Archivos generados (ignorados por git):**
+**Archivos generados (ignorados por git, anclados a la raíz del proyecto — no al directorio
+desde el que ejecutes):**
 - `library.db` — base SQLite, fuente de verdad (presencia por plataforma + estado de sync).
 - `canciones_to_apple.txt` — entrada del Atajo / lista de revisión para Apple.
 - `to_spotify_review.txt` — candidatos a agregar en Spotify, para revisar.
 - `unmatched.log` — canciones sin match cross-service.
-- `.tidal-cache` — token OAuth de Tidal (permisos `0600`).
+- `.tidal-cache` — token OAuth de Tidal (escrito de forma atómica con permisos `0600`).
 
 ---
 
