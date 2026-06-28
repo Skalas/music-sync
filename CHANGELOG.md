@@ -31,8 +31,16 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ### Security
 - Tidal token cache (`.tidal-cache`) written with mode `0600` (holds the refresh token).
 - Token-error exceptions no longer embed the OAuth response body (could echo `code`/token).
+- Tidal read/apply failures now log only the exception class name, never the exception
+  string (which could carry the request URL or response fragments if logs are redirected).
 
-### Deferred (see `docs/handoff/post-sprint-1.md`)
+### Fixed (review round)
+- `TIDAL_CLIENT_SECRET` removed: the PKCE public-client flow never sent it, so requiring it
+  in `.env` was dead config. Dropped from `_load_config`, `.env.example`, and the README.
+- `_RedirectHandler` OAuth `code`/`state` are reset before each listen, so a second
+  interactive auth in the same process can no longer read a stale authorization code.
+
+### Deferred (now planned as Sprint 3 — see `docs/sprint-3-connectors.md`)
 - Clean-arch: `application` imports `infrastructure.SpotifyProvider` for `write_review`.
-- `--no-apple`/`--no-spotify` vs `--no-tidal` semantic asymmetry.
-- `TIDAL_CLIENT_SECRET` required but unused under pure PKCE.
+- `--no-apple`/`--no-spotify` vs `--no-tidal` semantic asymmetry (intentional, undocumented).
+- Platform tuple `("spotify","apple","tidal")` hardcoded in 3 files; duplicated time/env helpers.

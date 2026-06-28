@@ -65,10 +65,9 @@ con **OAuth2 + PKCE**.
 
 1. Entra a **https://developer.tidal.com/dashboard** e inicia sesión.
 2. Crea una app. En **Redirect URI** usa exactamente **`http://127.0.0.1:8080`** (igual que Spotify).
-3. Copia el **Client ID** (y el **Client Secret** si la consola lo exige) a tu `.env`:
+3. Copia el **Client ID** a tu `.env` (el flujo PKCE de cliente público **no usa** Client Secret):
    ```bash
    TIDAL_CLIENT_ID=...
-   TIDAL_CLIENT_SECRET=...        # PKCE no lo envía; algunos paneles lo piden igual
    TIDAL_REDIRECT_URI=http://127.0.0.1:8080
    ```
 4. La primera corrida con Tidal abre el navegador para autorizar; el token se cachea en
