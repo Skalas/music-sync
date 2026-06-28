@@ -9,7 +9,7 @@ shipGate: "ruff check . && mypy . && pytest"   # full pre-PR gate (mirrors CI)
 # --- implementer (the only writer) ---------------------------------------
 implementer:
   backend: cursor          # cursor | codex | claude | gemini
-  model: ""                # e.g. composer-2.5 | gpt-5.3-codex-fast (blank = adapter default)
+  model: composer-2.5      # e.g. composer-2.5 | gpt-5.3-codex-fast (blank = adapter default)
 
 sessionFile: ".metate/session.json"
 issueLedger: ".metate/issues.json"   # issues filed by prep, read by ship for auto-close
@@ -30,9 +30,24 @@ codebaseMemory:
 # your real invariants — the difference between a generic review and one that
 # catches your domain's actual failure modes.
 reviewFocus: |
-  - <invariant 1, e.g. tenant/scope isolation on every transactional query>
-  - <invariant 2, e.g. money math at the cent in the payment path>
-  - <invariant 3, e.g. state transitions go through the domain guard>
+  - N-way union correctness: a track liked on ANY platform must be queued for EVERY
+    other platform where it is absent and not already recorded as synced. Adding a 3rd
+    platform must not silently change the existing Spotify⇄Apple behavior.
+  - All writes to every platform (Spotify, Apple, Tidal) are opt-in/guarded. A default
+    run reads, writes per-platform review files, and updates the DB — it never mutates a
+    remote library without the platform's explicit --apply flag.
+  - The normalized match key (name+primary artist) is the single source of cross-platform
+    identity. Never write to one platform using another platform's raw track id; always
+    resolve through a per-platform search/match.
+  - SQLite is the source of truth. Every sync decision and CSV export derives from the
+    `presence` rows. Upserts are idempotent (no duplicate keys), and a missing/locked DB
+    must fail loudly, never produce a partial sync.
+  - Tidal official-API coverage for personal favorites read/write is uncertain. The Tidal
+    adapter must degrade gracefully — on auth/scope/endpoint failure it skips the Tidal
+    direction with a clear message and never crashes the Spotify⇄Apple path.
+  - Secrets: Tidal client id/secret and tokens come from .env / token cache only; never
+    logged, never committed. New runtime artifacts (*.db, CSV exports, tidal cache) are
+    git-ignored.
 
 # Which buckets the implementer auto-fixes each round. Reporting is unconditional —
 # whatever isn't auto-fixed is still surfaced for you to decide.
@@ -45,10 +60,12 @@ review:
 # --- prep (metate-prep) ---------------------------------------------------
 prep:
   baseBranch: main         # branch new work from here (set to `dev` if you gitflow)
-  readingOrder: []         # docs to read before building, in order
+  readingOrder:            # docs to read before building, in order
+    - README.md
+    - docs/sprint-tidal-db.md
   techDebtFile: ""         # e.g. docs/TECH-DEBT.md
   issues:                  # file the issue ledger from the text plan at sprint start
-    create: true           # false = ledger is managed outside metate
+    create: false          # no git remote yet → ledger managed locally in issues.json
     tracker: github        # gh CLI
     granularity: test-matrix  # one issue per DoD test-matrix item (T1…Tn)
     labels: ["sprint"]     # applied to every filed issue
@@ -56,13 +73,19 @@ prep:
 
 # --- smoke (metate-smoke) -------------------------------------------------
 smoke:
-  command: ""              # e.g. pnpm e2e   (how to run the e2e/smoke suite)
-  seedCommand: ""          # e.g. pnpm db:seed   (must be idempotent)
+  # Offline behavior proof: seed a throwaway SQLite library, run an offline dry-run
+  # reconcile (no network), then prove CSV export. Build must provide the --offline/--db
+  # flags and the seed entrypoint these reference.
+  command: "uv run python sync_music.py --offline --dry-run --db .metate/smoke.db && uv run python sync_music.py --offline --export /tmp/smoke_export.csv --db .metate/smoke.db && test -s /tmp/smoke_export.csv"
+  seedCommand: "uv run python -m musicsync.seed --db .metate/smoke.db"   # must be idempotent
 
 # --- aftercare (metate-aftercare) -----------------------------------------
 # Deliverables to create/update at sprint close. Use {N} for the sprint number.
 aftercare:
-  deliverables: []         # e.g. ["docs/handoff/post-sprint-{N}.md", "CHANGELOG.md"]
+  deliverables:
+    - "docs/handoff/post-sprint-{N}.md"
+    - "README.md"
+    - "CHANGELOG.md"
 
 # --- ship (metate-ship) ---------------------------------------------------
 ship:
