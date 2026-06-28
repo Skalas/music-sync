@@ -73,7 +73,7 @@ class SyncService:
                         logger.error(
                             "Tidal: omitiendo dirección (%s). "
                             "Spotify⇄Apple continúan.",
-                            exc,
+                            exc.__class__.__name__,
                         )
                         result.skipped_providers.append("tidal")
                     else:
@@ -205,7 +205,8 @@ class SyncService:
             self._repo.mark_synced("tidal", [t.key for t in applied], when=now)
         except Exception as exc:
             logger.error(
-                "Tidal: fallo al aplicar likes (%s). Dirección omitida.", exc
+                "Tidal: fallo al aplicar likes (%s). Dirección omitida.",
+                exc.__class__.__name__,
             )
             result.skipped_providers.append("tidal")
 
