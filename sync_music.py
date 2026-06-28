@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 from musicsync.application.csv_export import export_csv
+from musicsync.application.output_paths import TO_APPLE_PATH, UNMATCHED_LOG_PATH
 from musicsync.application.sync_service import SyncOptions, SyncService
 from musicsync.domain.ports import LibraryProvider
 from musicsync.infrastructure.apple_provider import AppleProvider
@@ -108,10 +109,16 @@ def main() -> None:
                 SpotifyProvider(
                     base_dir=BASE_DIR,
                     need_write=args.apply_spotify,
+                    unmatched_log_path=UNMATCHED_LOG_PATH,
                 )
             )
         if not args.no_apple:
-            providers.append(AppleProvider(applescript_dir=APPLESCRIPT_DIR))
+            providers.append(
+                AppleProvider(
+                    applescript_dir=APPLESCRIPT_DIR,
+                    output_path=TO_APPLE_PATH,
+                )
+            )
         if not args.no_tidal:
             providers.append(
                 TidalProvider(

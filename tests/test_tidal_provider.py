@@ -137,6 +137,7 @@ def test_tidal_sync_service_skips_write_without_apply_flag(tmp_path: Path) -> No
     class FakeTidal:
         name = "tidal"
         can_write = True
+        graceful_on_apply_error = True
 
         def read_liked(self) -> list[Track]:
             return []
@@ -145,6 +146,9 @@ def test_tidal_sync_service_skips_write_without_apply_flag(tmp_path: Path) -> No
             nonlocal posted
             posted = True
             return tracks
+
+        def write_review(self, tracks: list[Track], path: object) -> None:
+            pass
 
     db = tmp_path / "lib.db"
     repo = SqliteTrackRepository(db)
@@ -166,6 +170,7 @@ def test_tidal_graceful_degradation_on_auth_failure(
     class FakeSpotify:
         name = "spotify"
         can_write = False
+        graceful_on_apply_error = False
 
         def read_liked(self) -> list[Track]:
             return [Track(name="Only", artist="Spotify")]
@@ -173,9 +178,13 @@ def test_tidal_graceful_degradation_on_auth_failure(
         def apply_likes(self, tracks: list[Track]) -> list[Track]:
             return tracks
 
+        def write_review(self, tracks: list[Track], path: object) -> None:
+            pass
+
     class FakeApple:
         name = "apple"
         can_write = True
+        graceful_on_apply_error = False
 
         def read_liked(self) -> list[Track]:
             return []
@@ -183,15 +192,22 @@ def test_tidal_graceful_degradation_on_auth_failure(
         def apply_likes(self, tracks: list[Track]) -> list[Track]:
             return tracks
 
+        def write_review(self, tracks: list[Track], path: object) -> None:
+            pass
+
     class FailingTidal:
         name = "tidal"
         can_write = False
+        graceful_on_apply_error = True
 
         def read_liked(self) -> list[Track]:
             raise TidalError("auth failed")
 
         def apply_likes(self, tracks: list[Track]) -> list[Track]:
             return []
+
+        def write_review(self, tracks: list[Track], path: object) -> None:
+            pass
 
     db = tmp_path / "lib.db"
     repo = SqliteTrackRepository(db)

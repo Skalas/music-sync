@@ -43,23 +43,3 @@ def compute_to_sync(
         result[target] = tracks_out
 
     return result
-
-
-def reconcile_legacy(
-    spotify: list[Track],
-    apple: list[Track],
-    state: dict[str, list[str]],
-) -> tuple[list[Track], list[Track]]:
-    """Pre-sprint 2-way reconcile — used only for backward-compat golden tests."""
-    spotify_keys = {t.key for t in spotify}
-    apple_keys = {t.key for t in apple}
-    done_apple = set(state.get("apple", []))
-    done_spotify = set(state.get("spotify", []))
-
-    to_apple = [
-        t for t in spotify if t.key not in apple_keys and t.key not in done_apple
-    ]
-    to_spotify = [
-        t for t in apple if t.key not in spotify_keys and t.key not in done_spotify
-    ]
-    return to_apple, to_spotify

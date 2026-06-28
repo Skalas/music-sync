@@ -4,19 +4,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 
+from musicsync.application.output_paths import TO_APPLE_PATH, TO_SPOTIFY_REVIEW_PATH
+from musicsync.domain._time import utc_now_iso
+from musicsync.domain.platforms import PLATFORMS
 from musicsync.domain.ports import LibraryProvider, TrackRepository
 from musicsync.domain.track import Track
 from musicsync.domain.union import compute_to_sync
-from musicsync.infrastructure.spotify_provider import SpotifyProvider
 
 logger = logging.getLogger(__name__)
-
-TO_APPLE_PATH = Path("canciones_to_apple.txt")
-TO_SPOTIFY_REVIEW_PATH = Path("to_spotify_review.txt")
-UNMATCHED_LOG_PATH = Path("unmatched.log")
 
 
 @dataclass
@@ -82,7 +79,7 @@ class SyncService:
         presence = self._repo.get_liked_by_platform()
         active_platforms = [
             p
-            for p in ("spotify", "apple", "tidal")
+            for p in PLATFORMS
             if not self._should_skip_provider(p, options)
         ]
         presence_filtered = {p: presence.get(p, {}) for p in active_platforms}
@@ -100,116 +97,104 @@ class SyncService:
             logger.info("(dry-run) No se escribe nada. Diff calculado arriba.")
             return result
 
-        now = _utc_now_iso()
+        now = utc_now_iso()
 
-        if not options.no_apple and "apple" in to_sync:
-            self._apply_apple(to_sync["apple"], options, result, now)
+        # Explicit apply order — apple before spotify before tidal — preserved
+        # because the order can affect which review files / log lines appear.
+        apply_order = ("apple", "spotify", "tidal")
+        review_paths: dict[str, Path | None] = {
+            "apple": TO_APPLE_PATH,
+            "spotify": TO_SPOTIFY_REVIEW_PATH,
+            "tidal": None,
+        }
+        skip_apply = {
+            "apple": options.no_apple,
+            "spotify": options.no_spotify,
+            "tidal": options.no_tidal,
+        }
+        apply_flags = {
+            "apple": options.apply_apple,
+            "spotify": options.apply_spotify,
+            "tidal": options.apply_tidal,
+        }
 
-        if not options.no_spotify and "spotify" in to_sync:
-            self._apply_spotify(to_sync["spotify"], options, result, now)
-
-        if not options.no_tidal and "tidal" in to_sync and "tidal" not in result.skipped_providers:
-            self._apply_tidal(to_sync["tidal"], options, result, now)
+        for platform in apply_order:
+            if skip_apply[platform] or platform not in to_sync:
+                continue
+            if platform in result.skipped_providers:
+                continue
+            self._apply_platform(
+                platform,
+                to_sync[platform],
+                apply_flags[platform],
+                result,
+                now,
+                review_path=review_paths[platform],
+            )
 
         return result
 
     def _should_skip_provider(self, platform: str, options: SyncOptions) -> bool:
+        """Return True only for tidal when --no-tidal is set.
+
+        INTENTIONAL ASYMMETRY: --no-tidal excludes Tidal from the union entirely
+        (no read, no write). --no-spotify and --no-apple are directional only —
+        they suppress writes toward that platform but still include it in the N-way
+        union reads. Only tidal is handled here because it is the only full-exclude flag.
+        """
         if platform == "tidal" and options.no_tidal:
             return True
         return False
 
-    def _apply_apple(
+    def _apply_platform(
         self,
+        platform: str,
         tracks: list[Track],
-        options: SyncOptions,
+        apply_flag: bool,
         result: SyncResult,
         now: str,
+        *,
+        review_path: Path | None = None,
     ) -> None:
+        """Shared skeleton: guard empty → look up provider → apply or review."""
         if not tracks:
-            logger.info("Apple Music ya está al día (0 nuevas).")
+            logger.info("%s ya está al día (0 nuevas).", platform.capitalize())
             return
 
-        provider = self._providers.get("apple")
+        provider = self._providers.get(platform)
         if provider is None:
             return
 
-        if options.apply_apple:
-            applied = provider.apply_likes(tracks)
-            result.applied["apple"] = len(applied)
-            self._repo.mark_synced("apple", [t.key for t in applied], when=now)
+        if apply_flag:
+            try:
+                applied = provider.apply_likes(tracks)
+                result.applied[platform] = len(applied)
+                self._repo.mark_synced(platform, [t.key for t in applied], when=now)
+            except Exception as exc:
+                if provider.graceful_on_apply_error:
+                    logger.error(
+                        "%s: fallo al aplicar likes (%s). Dirección omitida.",
+                        provider.name.capitalize(),
+                        exc.__class__.__name__,
+                    )
+                    result.skipped_providers.append(provider.name)
+                else:
+                    raise
         else:
-            TO_APPLE_PATH.write_text(
-                "\n".join(t.line for t in tracks) + "\n", encoding="utf-8"
-            )
-            logger.info(
-                "-> %d candidatos escritos en %s.\n"
-                "   Revísalos y corre de nuevo con --apply-apple para aplicarlos.",
-                len(tracks),
-                TO_APPLE_PATH.name,
-            )
-
-    def _apply_spotify(
-        self,
-        tracks: list[Track],
-        options: SyncOptions,
-        result: SyncResult,
-        now: str,
-    ) -> None:
-        if not tracks:
-            logger.info("Spotify ya está al día (0 nuevas).")
-            return
-
-        provider = self._providers.get("spotify")
-        if provider is None:
-            return
-
-        if options.apply_spotify:
-            applied = provider.apply_likes(tracks)
-            result.applied["spotify"] = len(applied)
-            self._repo.mark_synced("spotify", [t.key for t in applied], when=now)
-        else:
-            if isinstance(provider, SpotifyProvider):
-                provider.write_review(tracks, TO_SPOTIFY_REVIEW_PATH)
-            logger.info(
-                "-> %d candidatos escritos en %s.\n"
-                "   Revísalos y corre de nuevo con --apply-spotify para aplicarlos.",
-                len(tracks),
-                TO_SPOTIFY_REVIEW_PATH.name,
-            )
-
-    def _apply_tidal(
-        self,
-        tracks: list[Track],
-        options: SyncOptions,
-        result: SyncResult,
-        now: str,
-    ) -> None:
-        if not tracks:
-            logger.info("Tidal ya está al día (0 nuevas).")
-            return
-
-        provider = self._providers.get("tidal")
-        if provider is None:
-            return
-
-        if not options.apply_tidal:
-            logger.info(
-                "-> %d candidatos para Tidal (usa --apply-tidal para aplicar).",
-                len(tracks),
-            )
-            return
-
-        try:
-            applied = provider.apply_likes(tracks)
-            result.applied["tidal"] = len(applied)
-            self._repo.mark_synced("tidal", [t.key for t in applied], when=now)
-        except Exception as exc:
-            logger.error(
-                "Tidal: fallo al aplicar likes (%s). Dirección omitida.",
-                exc.__class__.__name__,
-            )
-            result.skipped_providers.append("tidal")
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+            if review_path is not None:
+                provider.write_review(tracks, review_path)
+                logger.info(
+                    "-> %d candidatos escritos en %s.\n"
+                    "   Revísalos y corre de nuevo con --apply-%s para aplicarlos.",
+                    len(tracks),
+                    review_path.name,
+                    provider.name,
+                )
+            else:
+                # No review file for this platform — just surface the count
+                logger.info(
+                    "-> %d candidatos para %s (usa --apply-%s para aplicar).",
+                    len(tracks),
+                    provider.name.capitalize(),
+                    provider.name,
+                )
