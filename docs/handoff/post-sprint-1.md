@@ -50,8 +50,14 @@
 
 ## Next sprint pointers
 
+- **Sprint 2 is planned: a local web app ("buttons") — see `docs/sprint-2-app.md`.** The CLI
+  is too manual to actually use; the next sprint wraps the existing `musicsync` core in a
+  FastAPI backend + TypeScript SPA with a connections panel, a searchable library dashboard
+  (per-platform links + "on all three" badge), guarded apply buttons, CSV export, and a
+  stretch "make a playlist". Decision: web app, not Swift, to reuse the tested Python core and
+  because Apple Music is local automation anyway. Two design problems to solve there: OAuth
+  port collision on 8080, and Apple having no stored track id (links are search-only until the
+  Shortcut/AppleScript captures a catalog id into `presence.platform_id`).
 - Decide Tidal's real coverage from a live run; if writes are unsupported, formalize Tidal as
   read-only in the union.
 - Add a GitHub remote so the issue ledger and PR auto-close wiring become live.
-- Consider a tiny read-only viewer (or just document `sqlite3 library.db` recipes) if CSV
-  isn't enough day-to-day.
