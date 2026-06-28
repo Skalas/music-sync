@@ -54,7 +54,7 @@ class TidalProvider:
 
     def _load_config(self) -> dict[str, str]:
         load_dotenv(self._base_dir / ".env")
-        keys = ["TIDAL_CLIENT_ID", "TIDAL_CLIENT_SECRET", "TIDAL_REDIRECT_URI"]
+        keys = ["TIDAL_CLIENT_ID", "TIDAL_REDIRECT_URI"]
         config = {k: os.environ.get(k, "").strip() for k in keys}
         missing = [k for k, v in config.items() if not v]
         if missing:
@@ -378,6 +378,8 @@ def _wait_for_redirect(redirect_uri: str) -> tuple[str, str | None]:
     if port in (80, 443):
         port = 8080
 
+    _RedirectHandler.code = None
+    _RedirectHandler.state = None
     server = HTTPServer(("127.0.0.1", port), _RedirectHandler)
     server.handle_request()
     server.server_close()

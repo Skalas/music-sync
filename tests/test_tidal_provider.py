@@ -17,7 +17,6 @@ from musicsync.infrastructure.tidal_provider import TidalError, TidalProvider
 @pytest.fixture
 def tidal_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("TIDAL_CLIENT_ID", "test-client")
-    monkeypatch.setenv("TIDAL_CLIENT_SECRET", "test-secret")
     monkeypatch.setenv("TIDAL_REDIRECT_URI", "http://127.0.0.1:8080")
     base = tmp_path
     (base / ".env").write_text("", encoding="utf-8")
