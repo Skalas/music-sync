@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from musicsync.domain.track import Track
@@ -13,6 +14,9 @@ class LibraryProvider(Protocol):
 
     name: str
     can_write: bool
+    graceful_on_apply_error: bool
+    """True → an apply failure is logged and the platform is skipped;
+    False → the exception propagates to the caller."""
 
     def read_liked(self) -> list[Track]:
         """Return all liked/favorite tracks from the remote library."""
@@ -21,6 +25,14 @@ class LibraryProvider(Protocol):
     def apply_likes(self, tracks: list[Track]) -> list[Track]:
         """Apply likes on the platform. Returns tracks successfully synced."""
         ...
+
+    def write_review(self, tracks: list[Track], path: Path) -> None:
+        """Write a review file of candidate tracks.
+
+        Providers without a review flow inherit this no-op rather than raising
+        AttributeError, so omitting the method degrades gracefully.
+        """
+        pass
 
 
 @runtime_checkable

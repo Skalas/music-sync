@@ -5,9 +5,10 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
+from musicsync.domain.platforms import PLATFORMS
 from musicsync.domain.ports import TrackRepository
 
-PLATFORM_COLUMNS = ("spotify", "apple", "tidal")
+PLATFORM_COLUMNS = PLATFORMS
 
 
 def export_csv(repo: TrackRepository, path: Path) -> int:

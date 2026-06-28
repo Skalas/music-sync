@@ -8,6 +8,8 @@ import json
 import logging
 import os
 import secrets
+import tempfile
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -15,11 +17,11 @@ from typing import Any, cast
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 import requests
-from dotenv import load_dotenv
 from requests.exceptions import RequestException
 from tqdm import tqdm
 
 from musicsync.domain.track import Track
+from musicsync.infrastructure._env import load_env_keys
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,7 @@ class TidalError(Exception):
 class TidalProvider:
     name = "tidal"
     can_write = True
+    graceful_on_apply_error = True
 
     def __init__(
         self,
@@ -53,10 +56,8 @@ class TidalProvider:
         self._config = self._load_config()
 
     def _load_config(self) -> dict[str, str]:
-        load_dotenv(self._base_dir / ".env")
         keys = ["TIDAL_CLIENT_ID", "TIDAL_REDIRECT_URI"]
-        config = {k: os.environ.get(k, "").strip() for k in keys}
-        missing = [k for k, v in config.items() if not v]
+        config, missing = load_env_keys(self._base_dir, keys)
         if missing:
             raise TidalError(
                 "faltan credenciales Tidal en .env: "
@@ -95,6 +96,9 @@ class TidalProvider:
 
         tracks.sort(key=lambda t: t.added_at or "")
         return tracks
+
+    def write_review(self, tracks: list[Track], path: Path) -> None:
+        """No-op: Tidal does not have a review-file flow."""
 
     def apply_likes(self, tracks: list[Track]) -> list[Track]:
         token = self._ensure_token(need_write=True)
@@ -262,10 +266,16 @@ class TidalProvider:
         return cast(dict[str, Any], json.loads(self._cache_path.read_text(encoding="utf-8")))
 
     def _write_cache(self, data: dict[str, Any]) -> None:
-        self._cache_path.write_text(
-            json.dumps(data, indent=2), encoding="utf-8"
-        )
-        self._cache_path.chmod(0o600)
+        fd, tmp_name = tempfile.mkstemp(dir=str(self._cache_path.parent))
+        tmp_path = Path(tmp_name)
+        try:
+            os.chmod(tmp_path, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(data, indent=2))
+            os.replace(tmp_path, self._cache_path)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
 
 def _api_headers(token: str) -> dict[str, str]:
@@ -288,8 +298,6 @@ def _token_expired(cached: dict[str, Any]) -> bool:
 
 
 def _now_epoch() -> float:
-    import time
-
     return time.time()
 
 
@@ -355,21 +363,25 @@ def _artist_name(
     return ""
 
 
-class _RedirectHandler(BaseHTTPRequestHandler):
-    code: str | None = None
-    state: str | None = None
+def _make_redirect_handler(
+    holder: dict[str, str | None],
+) -> type[BaseHTTPRequestHandler]:
+    class _RedirectHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            qs = parse_qs(urlparse(self.path).query)
+            holder["code"] = qs.get("code", [None])[0]
+            holder["state"] = qs.get("state", [None])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(
+                b"<html><body>Autorizado. Puedes cerrar esta ventana.</body></html>"
+            )
 
-    def do_GET(self) -> None:  # noqa: N802
-        qs = parse_qs(urlparse(self.path).query)
-        _RedirectHandler.code = qs.get("code", [None])[0]
-        _RedirectHandler.state = qs.get("state", [None])[0]
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"<html><body>Autorizado. Puedes cerrar esta ventana.</body></html>")
+        def log_message(self, format: str, *args: Any) -> None:
+            return
 
-    def log_message(self, format: str, *args: Any) -> None:
-        return
+    return _RedirectHandler
 
 
 def _wait_for_redirect(redirect_uri: str) -> tuple[str, str | None]:
@@ -378,12 +390,11 @@ def _wait_for_redirect(redirect_uri: str) -> tuple[str, str | None]:
     if port in (80, 443):
         port = 8080
 
-    _RedirectHandler.code = None
-    _RedirectHandler.state = None
-    server = HTTPServer(("127.0.0.1", port), _RedirectHandler)
+    holder: dict[str, str | None] = {"code": None, "state": None}
+    server = HTTPServer(("127.0.0.1", port), _make_redirect_handler(holder))
     server.handle_request()
     server.server_close()
 
-    if not _RedirectHandler.code:
+    if not holder["code"]:
         raise TidalError("no se recibió código de autorización Tidal")
-    return _RedirectHandler.code, _RedirectHandler.state
+    return holder["code"], holder["state"]

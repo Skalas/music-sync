@@ -1,6 +1,6 @@
 # Sprint 3 plan — connector abstraction & cleanup
 
-**Status:** planned, not started.
+**Status:** shipped on `refactor/connector-abstraction` (see `docs/handoff/post-sprint-3.md`).
 **Sequencing:** runs **before** Sprint 2 (the local web app / dashboard, `docs/sprint-2-app.md`,
 which is captured-not-started). Rationale: the dashboard will add a *fourth* consumer of the
 provider layer (`PlaylistService` + FastAPI). Doing it on today's duplicated, leaky connector

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
 from pathlib import Path
 
+from musicsync.domain._time import utc_now_iso
+from musicsync.domain.platforms import PLATFORMS
 from musicsync.domain.track import Track
 
 SCHEMA_SQL = """
@@ -32,9 +33,6 @@ CREATE TABLE IF NOT EXISTS _meta (
     value TEXT NOT NULL
 );
 """
-
-PLATFORMS = ("spotify", "apple", "tidal")
-
 
 class DatabaseError(Exception):
     """Raised when the SQLite database cannot be opened or used."""
@@ -71,7 +69,7 @@ class SqliteTrackRepository:
         *,
         liked: bool = True,
     ) -> None:
-        now = _utc_now()
+        now = utc_now_iso()
         for track in tracks:
             self._upsert_track(track, now)
             self._conn.execute(
@@ -184,7 +182,7 @@ class SqliteTrackRepository:
             return False
 
         data = json.loads(state_path.read_text(encoding="utf-8"))
-        now = _utc_now()
+        now = utc_now_iso()
         for platform in ("apple", "spotify"):
             for key in data.get(platform, []):
                 row = self._conn.execute(
@@ -240,7 +238,3 @@ class SqliteTrackRepository:
             }
             for row in rows
         ]
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
