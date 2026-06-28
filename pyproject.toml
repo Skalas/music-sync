@@ -1,0 +1,14 @@
+[project]
+name = "music-sync"
+version = "0.1.0"
+description = "Conciliador bidireccional de Liked Songs entre Spotify y Apple Music (local y soberano)"
+requires-python = ">=3.10"
+dependencies = [
+    "spotipy>=2.24.0",
+    "python-dotenv>=1.0.1",
+    "tqdm>=4.66.0",
+    "unidecode>=1.3.8",
+]
+
+[tool.uv]
+package = false

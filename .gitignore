@@ -1,0 +1,23 @@
+# Secretos y entorno
+.env
+.venv/
+.cache
+
+# Estado y artefactos generados en runtime
+state.json
+canciones_to_apple.txt
+to_spotify_review.txt
+unmatched.log
+
+# Python
+__pycache__/
+*.pyc
+
+# metate session handoff
+.metate/session.json
+# metate issue ledger
+.metate/issues.json
+# metate profile reconcile backups
+.metate/*.bak
+# codebase-memory Cursor rule is installed tooling (source: metate repo)
+.cursor/rules/codebase-memory.mdc
