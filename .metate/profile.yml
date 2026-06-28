@@ -8,8 +8,8 @@ shipGate: "ruff check . && mypy . && pytest"   # full pre-PR gate (mirrors CI)
 
 # --- implementer (the only writer) ---------------------------------------
 implementer:
-  backend: cursor          # cursor | codex | claude | gemini
-  model: composer-2.5      # e.g. composer-2.5 | gpt-5.3-codex-fast (blank = adapter default)
+  backend: claude          # cursor | codex | claude | gemini
+  model: sonnet            # e.g. composer-2.5 | gpt-5.3-codex-fast (blank = adapter default)
 
 sessionFile: ".metate/session.json"
 issueLedger: ".metate/issues.json"   # issues filed by prep, read by ship for auto-close
