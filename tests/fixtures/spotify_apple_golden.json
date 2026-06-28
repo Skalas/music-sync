@@ -1,0 +1,15 @@
+{
+  "spotify": [
+    {"name": "Bohemian Rhapsody", "artist": "Queen"},
+    {"name": "Imagine", "artist": "John Lennon"},
+    {"name": "Stairway to Heaven", "artist": "Led Zeppelin"}
+  ],
+  "apple": [
+    {"name": "Bohemian Rhapsody", "artist": "Queen"},
+    {"name": "Hotel California", "artist": "Eagles"}
+  ],
+  "state": {
+    "apple": [],
+    "spotify": []
+  }
+}

@@ -1,22 +1,36 @@
-# music-sync — Conciliador bidireccional Spotify ⇄ Apple Music
+# music-sync — Conciliador N-direcciones Spotify ⇄ Apple Music ⇄ Tidal
 
-Mantiene en sincronía tus canciones **"Me Gusta" (Liked Songs)** entre **Spotify** y **Apple Music**,
-de forma **local y soberana**: sin apps de terceros, sin servidores externos, sin APIs de pago.
+Mantiene en sincronía tus canciones **"Me Gusta" (Liked Songs / Favoritas)** entre **Spotify**,
+**Apple Music** y **Tidal**, de forma **local y soberana**: sin apps de terceros, sin servidores
+externos, sin APIs de pago.
 
-**Regla de unión:** si una canción está marcada en cualquiera de las dos plataformas, queda marcada en
-ambas. La conciliación es **incremental** (recuerda lo ya hecho en `state.json`).
+**Regla de unión:** si una canción está marcada en **cualquiera** de las plataformas conectadas,
+debe quedar marcada en **todas**. El estado vive en una **base de datos SQLite** (`library.db`) que es
+la **fuente de verdad** y reemplaza al antiguo `state.json` (migrado automáticamente en la primera
+corrida). La conciliación es **incremental**: solo procesa lo que falta en cada plataforma.
 
 ```
-SPOTIFY (Liked)  ──user-library-read──┐
-                                       ├──► match por nombre+artista ──► diff
-APPLE MUSIC (Favoritas) ──osascript────┘
+SPOTIFY (Liked)   ──user-library-read──┐
+APPLE MUSIC (Fav) ──osascript──────────┤
+TIDAL (Favorites) ──OAuth2 API─────────┘
         │
-        ├─ faltan en Apple   → Atajo (buscar en tienda + añadir) → osascript marca Love
-        └─ faltan en Spotify → revisión → (--apply-spotify) → API agrega like
+        ▼
+   library.db (SQLite, fuente de verdad)  ──►  unión N-direcciones  ──►  diff por plataforma
+        │                                                                      │
+        ├─ exportable a CSV (--export)                                         │
+        │                                                                      ▼
+        └─ faltan en Apple   → Atajo + Love        (--apply-apple)
+           faltan en Spotify → API agrega like     (--apply-spotify)
+           faltan en Tidal   → API add favorite    (--apply-tidal)
 ```
 
-> **Seguridad:** escribir en Spotify es **opt-in**. Por defecto solo se genera un archivo de revisión
-> (`to_spotify_review.txt`); las altas reales requieren `--apply-spotify`.
+> **Seguridad:** escribir en **cualquier** plataforma es **opt-in**. Por defecto la herramienta solo
+> lee, actualiza `library.db` y genera archivos de revisión; las altas reales requieren el flag
+> `--apply-<plataforma>` correspondiente.
+>
+> **Tidal es best-effort:** la cobertura de la API oficial para favoritos personales es incierta. Si
+> Tidal falla (auth/scope/endpoint), la herramienta lo registra una vez, **omite** la dirección de Tidal
+> y la conciliación Spotify⇄Apple continúa sin interrupción.
 
 ---
 
@@ -44,12 +58,32 @@ APPLE MUSIC (Favoritas) ──osascript────┘
 
 ---
 
+## 1b. Crear la app en Tidal Developer (opcional, para incluir Tidal)
+
+Tidal no tiene un hook tipo AppleScript, así que se usa la **API oficial** (`developer.tidal.com`)
+con **OAuth2 + PKCE**.
+
+1. Entra a **https://developer.tidal.com/dashboard** e inicia sesión.
+2. Crea una app. En **Redirect URI** usa exactamente **`http://127.0.0.1:8080`** (igual que Spotify).
+3. Copia el **Client ID** a tu `.env` (el flujo PKCE de cliente público **no usa** Client Secret):
+   ```bash
+   TIDAL_CLIENT_ID=...
+   TIDAL_REDIRECT_URI=http://127.0.0.1:8080
+   ```
+4. La primera corrida con Tidal abre el navegador para autorizar; el token se cachea en
+   `.tidal-cache` (permisos `0600`, ignorado por git).
+
+> Si no configuras Tidal, corre con `--no-tidal` y la herramienta funciona igual que antes
+> (solo Spotify⇄Apple). Si lo configuras pero la API falla, Tidal se omite con un aviso.
+
+---
+
 ## 2. Instalación
 
 ```bash
 cd ~/github/skalas/music-sync
 uv venv .venv && source .venv/bin/activate
-uv pip install spotipy python-dotenv tqdm unidecode
+uv sync                 # instala deps de runtime + dev (pytest, ruff, mypy) desde uv.lock
 ```
 
 ---
@@ -97,39 +131,56 @@ Revisa que esas canciones aparezcan en tu biblioteca de Música.
 
 ```bash
 # Conciliación segura (por defecto):
-#  - empuja a Apple Music lo que falta (Atajo + Love)
-#  - genera to_spotify_review.txt SIN escribir en Spotify
+#  - lee Spotify + Apple Music + Tidal y actualiza library.db
+#  - genera archivos de revisión SIN escribir en ningún servicio remoto
 uv run sync_music.py
 
-# Tras revisar to_spotify_review.txt, aplica las altas en Spotify:
-uv run sync_music.py --apply-spotify
+# Aplica realmente las altas, por plataforma (combinables):
+uv run sync_music.py --apply-apple --apply-spotify --apply-tidal
+
+# Ver / exportar tu biblioteca unificada a CSV (no toca la red):
+uv run sync_music.py --offline --export biblioteca.csv
 ```
 
-La **primera corrida** abre el navegador para autorizar (Spotify) y pide permisos de Automatización
-(Música). Las siguientes son silenciosas e incrementales.
+La **primera corrida** abre el navegador para autorizar (Spotify y, si lo configuraste, Tidal) y pide
+permisos de Automatización (Música). Las siguientes son silenciosas e incrementales.
 
 **Flags útiles:**
 
 | Flag | Efecto |
 |---|---|
 | `--apply-spotify` | Aplica realmente los likes nuevos en Spotify (requiere scope de escritura). |
+| `--apply-apple` | Aplica realmente las altas en Apple Music (Atajo + Love). |
+| `--apply-tidal` | Aplica realmente las altas en Tidal Favorites (requiere scope de escritura). |
+| `--export PATH.csv` | Exporta toda la biblioteca a CSV (una fila por canción, una columna por plataforma) y termina. |
+| `--db PATH` | Ruta de la base SQLite (por defecto `library.db`). |
+| `--offline` | No usa la red; opera solo sobre `library.db` (para exportar o inspeccionar el diff). |
 | `--dry-run` | Solo reporta el diff; no escribe en ningún lado. |
-| `--full` | Ignora `state.json` y reconcilia todo desde cero. |
-| `--no-apple` | No empuja hacia Apple Music. |
+| `--full` | Reconcilia todo desde cero (ignora lo ya marcado como sincronizado). |
+| `--no-apple` | No procesa la dirección hacia Apple Music. |
 | `--no-spotify` | No procesa la dirección hacia Spotify. |
+| `--no-tidal` | Excluye Tidal por completo de la unión. |
+
+**Base de datos (`library.db`, fuente de verdad):**
+- Tabla `tracks` (una fila por canción normalizada) y `presence` (qué plataformas la tienen marcada y
+  cuándo se sincronizó). Sustituye a `state.json`, que se **migra automáticamente** una sola vez.
+- Inspecciónala con cualquier cliente SQLite, o expórtala con `--export`.
 
 **Archivos generados (ignorados por git):**
-- `state.json` — claves ya conciliadas en cada lado (incremental).
-- `canciones_to_apple.txt` — entrada del Atajo (solo lo nuevo).
+- `library.db` — base SQLite, fuente de verdad (presencia por plataforma + estado de sync).
+- `canciones_to_apple.txt` — entrada del Atajo / lista de revisión para Apple.
 - `to_spotify_review.txt` — candidatos a agregar en Spotify, para revisar.
-- `unmatched.log` — canciones de Apple sin match en Spotify.
+- `unmatched.log` — canciones sin match cross-service.
+- `.tidal-cache` — token OAuth de Tidal (permisos `0600`).
 
 ---
 
 ## Limitaciones conocidas
 
 - **Match cross-service** por nombre+artista normalizado: heurístico, no infalible (versiones en vivo,
-  remasters, nombres ambiguos). Por eso la escritura en Spotify pasa por revisión previa.
+  remasters, nombres ambiguos). Por eso toda escritura remota pasa por revisión previa (opt-in).
+- **Tidal** usa la API oficial, cuya cobertura de favoritos personales es incierta y puede cambiar; la
+  herramienta degrada con gracia (omite Tidal) si la API no responde como se espera.
 - **Orden:** Apple Music no expone una lista de "Me Gusta" ordenada; las canciones se **procesan** en
   orden por fecha de like (`added_at`) pero su posición final en la biblioteca la decide Music.app.
 - La propiedad de favorita cambió de `loved` a `favorited` entre versiones de macOS; el AppleScript

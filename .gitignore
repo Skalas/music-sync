@@ -2,12 +2,17 @@
 .env
 .venv/
 .cache
+.tidal-cache
 
 # Estado y artefactos generados en runtime
 state.json
+library.db
+*.db
 canciones_to_apple.txt
 to_spotify_review.txt
 unmatched.log
+*_export.csv
+export.csv
 
 # Python
 __pycache__/
