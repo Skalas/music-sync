@@ -137,7 +137,7 @@ def test_tidal_sync_service_skips_write_without_apply_flag(tmp_path: Path) -> No
     class FakeTidal:
         name = "tidal"
         can_write = True
-        graceful_on_apply_error = True
+        graceful_on_error = True
 
         def read_liked(self) -> list[Track]:
             return []
@@ -170,7 +170,7 @@ def test_tidal_graceful_degradation_on_auth_failure(
     class FakeSpotify:
         name = "spotify"
         can_write = False
-        graceful_on_apply_error = False
+        graceful_on_error = False
 
         def read_liked(self) -> list[Track]:
             return [Track(name="Only", artist="Spotify")]
@@ -184,7 +184,7 @@ def test_tidal_graceful_degradation_on_auth_failure(
     class FakeApple:
         name = "apple"
         can_write = True
-        graceful_on_apply_error = False
+        graceful_on_error = False
 
         def read_liked(self) -> list[Track]:
             return []
@@ -198,7 +198,7 @@ def test_tidal_graceful_degradation_on_auth_failure(
     class FailingTidal:
         name = "tidal"
         can_write = False
-        graceful_on_apply_error = True
+        graceful_on_error = True
 
         def read_liked(self) -> list[Track]:
             raise TidalError("auth failed")

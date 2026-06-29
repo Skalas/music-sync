@@ -14,7 +14,7 @@ from spotipy.exceptions import SpotifyException
 from spotipy.oauth2 import SpotifyOAuth
 from tqdm import tqdm
 
-from musicsync.domain.track import Track
+from musicsync.domain.track import Track, date_only, year_from_date
 from musicsync.infrastructure._env import load_env_keys
 
 SCOPE_READ = "user-library-read"
@@ -27,7 +27,7 @@ MAX_RETRIES = 3
 class SpotifyProvider:
     name = "spotify"
     can_write = True
-    graceful_on_apply_error = False
+    graceful_on_error = False
 
     def __init__(
         self,
@@ -94,12 +94,21 @@ class SpotifyProvider:
                     track = item.get("track")
                     if not track or not track.get("id"):
                         continue
+                    album_data = track.get("album") or {}
+                    images = album_data.get("images") or []
+                    duration_ms = track.get("duration_ms")
                     tracks.append(
                         Track(
                             name=track["name"],
-                            artist=", ".join(a["name"] for a in track["artists"]),
+                            artist=", ".join(a["name"] for a in track.get("artists", [])),
                             platform_id=track["id"],
-                            added_at=item.get("added_at"),
+                            added_at=date_only(item.get("added_at")),
+                            album=album_data.get("name") or None,
+                            artwork_url=images[0].get("url") if images else None,
+                            duration_sec=(
+                                round(duration_ms / 1000) if duration_ms is not None else None
+                            ),
+                            year=year_from_date(album_data.get("release_date")),
                         )
                     )
                     bar.update(1)

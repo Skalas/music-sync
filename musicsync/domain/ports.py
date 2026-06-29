@@ -14,8 +14,8 @@ class LibraryProvider(Protocol):
 
     name: str
     can_write: bool
-    graceful_on_apply_error: bool
-    """True → an apply failure is logged and the platform is skipped;
+    graceful_on_error: bool
+    """True → a read or apply failure is logged and the platform is skipped;
     False → the exception propagates to the caller."""
 
     def read_liked(self) -> list[Track]:
@@ -69,6 +69,15 @@ class TrackRepository(Protocol):
         """One-time import from legacy state.json. Returns True if migrated."""
         ...
 
-    def iter_export_rows(self) -> list[dict[str, str | int]]:
+    def iter_export_rows(self) -> list[dict[str, str | int | None]]:
         """Pivot rows for CSV export: one row per track, columns per platform."""
+        ...
+
+    def iter_enriched_rows(
+        self, *, sort_by: str | None = None
+    ) -> list[dict[str, str | int | None]]:
+        """Enriched rows with per-platform presence, deep-link ids, metadata, and added_at.
+
+        When sort_by='added_at', rows are ordered most-recently-added first.
+        """
         ...

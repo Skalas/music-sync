@@ -176,6 +176,42 @@ desde el que ejecutes):**
 
 ---
 
+## 5. App web ("buttons")
+
+Una app local que envuelve el mismo motor `musicsync` en una API FastAPI + una SPA en
+TypeScript. Se ejecuta en tu máquina (nunca expuesta a la red).
+
+```bash
+# Lo más simple — levanta backend + frontend y abre el navegador (Ctrl+C detiene ambos):
+make dev
+
+# O por separado, en dos terminales:
+uv run python -m musicsync.web        # backend (API en 127.0.0.1:8000)
+cd web && npm install && npm run dev   # frontend (SPA en http://localhost:5173)
+```
+
+> `make help` lista todas las tareas (`install`, `sync`, `apply`, `export`, `gate`, `smoke`, …).
+
+Abre **http://localhost:5173**. Tres vistas:
+- **Connections** — estado por plataforma (configurada / conectada) y botón **Connect** que
+  inicia el OAuth (Spotify/Tidal); Apple es automatización local (sin OAuth). Las credenciales
+  viven solo en `.env`.
+- **Library** — tabla desde `library.db`: búsqueda/filtro, carátula, álbum, año, duración y
+  "Added" (ordenable por fecha de alta), una columna por plataforma con enlace directo cuando hay
+  `platform_id` (Apple usa enlace de búsqueda), e insignia "on all three".
+- **Actions** — **Sync now** (dry-run en vivo: lee **solo las plataformas conectadas** y muestra
+  el diff; no escribe en remoto), botones **Apply** por plataforma (con confirmación, ruta
+  protegida equivalente a `--apply-*`) y **Export CSV**.
+
+Notas:
+- El servidor escucha en `127.0.0.1:8000` y deja libre el `:8080` para el callback OAuth.
+- Los POST que cambian estado exigen la cabecera `X-Requested-With` (protección CSRF para una
+  API local); la SPA la envía automáticamente.
+- "Sync now" omite con gracia cualquier plataforma no conectada — nunca falla por falta de
+  credenciales.
+
+---
+
 ## Limitaciones conocidas
 
 - **Match cross-service** por nombre+artista normalizado: heurístico, no infalible (versiones en vivo,
