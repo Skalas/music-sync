@@ -16,18 +16,18 @@ import sys
 from pathlib import Path
 
 from musicsync.application.csv_export import export_csv
-from musicsync.application.output_paths import TO_APPLE_PATH, UNMATCHED_LOG_PATH
+from musicsync.application.output_paths import (
+    APPLESCRIPT_DIR,
+    BASE_DIR,
+    DEFAULT_DB,
+    STATE_PATH,
+    TO_APPLE_PATH,
+    UNMATCHED_LOG_PATH,
+)
 from musicsync.application.sync_service import SyncOptions, SyncService
 from musicsync.domain.ports import LibraryProvider
-from musicsync.infrastructure.apple_provider import AppleProvider
-from musicsync.infrastructure.spotify_provider import SpotifyProvider
+from musicsync.infrastructure.providers import build_providers
 from musicsync.infrastructure.sqlite_repository import DatabaseError, SqliteTrackRepository
-from musicsync.infrastructure.tidal_provider import TidalProvider
-
-BASE_DIR = Path(__file__).resolve().parent
-APPLESCRIPT_DIR = BASE_DIR / "applescript"
-STATE_PATH = BASE_DIR / "state.json"
-DEFAULT_DB = BASE_DIR / "library.db"
 
 
 def parse_args() -> argparse.Namespace:
@@ -104,28 +104,17 @@ def main() -> None:
 
     providers: list[LibraryProvider] = []
     if not args.offline:
-        if not args.no_spotify:
-            providers.append(
-                SpotifyProvider(
-                    base_dir=BASE_DIR,
-                    need_write=args.apply_spotify,
-                    unmatched_log_path=UNMATCHED_LOG_PATH,
-                )
-            )
-        if not args.no_apple:
-            providers.append(
-                AppleProvider(
-                    applescript_dir=APPLESCRIPT_DIR,
-                    output_path=TO_APPLE_PATH,
-                )
-            )
-        if not args.no_tidal:
-            providers.append(
-                TidalProvider(
-                    base_dir=BASE_DIR,
-                    need_write=args.apply_tidal,
-                )
-            )
+        providers = build_providers(
+            BASE_DIR,
+            applescript_dir=APPLESCRIPT_DIR,
+            output_path=TO_APPLE_PATH,
+            unmatched_log_path=UNMATCHED_LOG_PATH,
+            need_write_spotify=args.apply_spotify,
+            need_write_tidal=args.apply_tidal,
+            include_spotify=not args.no_spotify,
+            include_apple=not args.no_apple,
+            include_tidal=not args.no_tidal,
+        )
 
     options = SyncOptions(
         apply_spotify=args.apply_spotify,

@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import tempfile
 import time
@@ -20,7 +21,7 @@ import requests
 from requests.exceptions import RequestException
 from tqdm import tqdm
 
-from musicsync.domain.track import Track
+from musicsync.domain.track import Track, date_only, year_from_date
 from musicsync.infrastructure._env import load_env_keys
 
 logger = logging.getLogger(__name__)
@@ -40,7 +41,7 @@ class TidalError(Exception):
 class TidalProvider:
     name = "tidal"
     can_write = True
-    graceful_on_apply_error = True
+    graceful_on_error = True
 
     def __init__(
         self,
@@ -319,6 +320,47 @@ def _index_included(included: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
     return index
 
 
+def _parse_iso8601_duration(value: str) -> int | None:
+    """Parse ISO-8601 duration like PT3M20S to seconds. Returns None if unparseable
+    or if no time components are present (e.g. bare 'PT')."""
+    m = re.fullmatch(
+        r"P(?:(\d+)D)?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?",
+        value.strip(),
+    )
+    if not m:
+        return None
+    # If no group captured any digits, the input had no meaningful duration.
+    if not any([m.group(1), m.group(2), m.group(3), m.group(4)]):
+        return None
+    days = int(m.group(1) or 0)
+    hours = int(m.group(2) or 0)
+    minutes = int(m.group(3) or 0)
+    seconds = float(m.group(4) or 0)
+    return days * 86400 + hours * 3600 + minutes * 60 + round(seconds)
+
+
+def _album_metadata(
+    resource: dict[str, Any], included: dict[str, dict[str, Any]]
+) -> tuple[str | None, str | None, str | None]:
+    """Return (album_name, year, artwork_url) from the track's album relationship."""
+    rel = resource.get("relationships", {}).get("albums", {})
+    for ref in rel.get("data", []):
+        album = included.get(f"{ref.get('type')}:{ref.get('id')}")
+        if album is None:
+            continue
+        attrs = album.get("attributes", {})
+        name = attrs.get("title") or attrs.get("name") or None
+        year = year_from_date(attrs.get("releaseDate"))
+        image_links = attrs.get("imageLinks") or []
+        artwork_url = image_links[0].get("href") if image_links else None
+        # Also try cover attribute (some endpoints return it differently)
+        if not artwork_url:
+            cover = attrs.get("cover") or ""
+            artwork_url = cover if cover.startswith("https://") else None
+        return name, year, artwork_url
+    return None, None, None
+
+
 def _parse_collection_item(
     item: dict[str, Any], included: dict[str, dict[str, Any]]
 ) -> Track | None:
@@ -337,16 +379,30 @@ def _parse_collection_item(
     attrs = resource.get("attributes", {})
     title = attrs.get("title") or attrs.get("name") or ""
     artist = _artist_name(resource, included)
-    added_at = (item.get("meta") or {}).get("addedAt")
+    added_at = date_only((item.get("meta") or {}).get("addedAt"))
 
     if not title:
         return None
+
+    # Duration: may be integer seconds or ISO-8601 string
+    raw_duration = attrs.get("duration")
+    duration_sec: int | None = None
+    if isinstance(raw_duration, (int, float)):
+        duration_sec = round(raw_duration)
+    elif isinstance(raw_duration, str):
+        duration_sec = _parse_iso8601_duration(raw_duration)
+
+    album_name, year, artwork_url = _album_metadata(resource, included)
 
     return Track(
         name=title,
         artist=artist,
         platform_id=str(ref_id),
         added_at=added_at,
+        album=album_name,
+        artwork_url=artwork_url,
+        duration_sec=duration_sec,
+        year=year,
     )
 
 
@@ -392,9 +448,14 @@ def _wait_for_redirect(redirect_uri: str) -> tuple[str, str | None]:
 
     holder: dict[str, str | None] = {"code": None, "state": None}
     server = HTTPServer(("127.0.0.1", port), _make_redirect_handler(holder))
-    server.handle_request()
-    server.server_close()
+    server.timeout = 120
+    try:
+        server.handle_request()
+        if not holder["code"]:
+            # handle_request returns on timeout with nothing captured — free the
+            # port instead of leaving an abandoned flow holding :8080.
+            raise TidalError("OAuth flow timed out or was abandoned")
+    finally:
+        server.server_close()
 
-    if not holder["code"]:
-        raise TidalError("no se recibió código de autorización Tidal")
     return holder["code"], holder["state"]

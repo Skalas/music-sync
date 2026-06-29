@@ -6,15 +6,54 @@ import subprocess
 import sys
 from pathlib import Path
 
-from musicsync.domain.track import Track
+from musicsync.domain.track import Track, year_from_date
 
 SHORTCUT_NAME = "SyncToAppleMusic"
+_TAB = "\t"
+
+
+def _parse_apple_line(line: str) -> Track | None:
+    """Parse one line of AppleScript output.
+
+    New format (6 tab-separated fields):
+        name TAB artist TAB album TAB year TAB duration_sec TAB date_added
+
+    Legacy fallback (old "Name - Artist" format): parse just name and artist.
+    Any line that doesn't match either format is skipped.
+    """
+    if _TAB in line:
+        # 6 fields; split at most 5 times so a stray tab in the last field (date)
+        # doesn't shift positions.
+        parts = line.split(_TAB, 5)
+        if len(parts) < 2:
+            return None
+        name = parts[0].strip()
+        artist = parts[1].strip()
+        if not name and not artist:
+            return None
+        album = parts[2].strip() if len(parts) > 2 else None
+        year_raw = parts[3].strip() if len(parts) > 3 else ""
+        dur_raw = parts[4].strip() if len(parts) > 4 else ""
+        added_at = parts[5].strip() if len(parts) > 5 else None
+        return Track(
+            name=name,
+            artist=artist,
+            album=album or None,
+            year=year_from_date(year_raw or None),
+            duration_sec=int(dur_raw) if dur_raw.isdigit() else None,
+            added_at=added_at or None,
+        )
+    # Legacy format: "Name - Artist"
+    if " - " not in line:
+        return None
+    name, _, artist = line.rpartition(" - ")
+    return Track(name=name.strip(), artist=artist.strip())
 
 
 class AppleProvider:
     name = "apple"
     can_write = True
-    graceful_on_apply_error = False
+    graceful_on_error = False
 
     def __init__(
         self,
@@ -42,10 +81,11 @@ class AppleProvider:
         tracks: list[Track] = []
         for line in result.stdout.splitlines():
             line = line.strip()
-            if not line or " - " not in line:
+            if not line:
                 continue
-            name, _, artist = line.rpartition(" - ")
-            tracks.append(Track(name=name.strip(), artist=artist.strip()))
+            track = _parse_apple_line(line)
+            if track is not None:
+                tracks.append(track)
         return tracks
 
     def apply_likes(self, tracks: list[Track]) -> list[Track]:
