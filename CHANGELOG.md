@@ -3,6 +3,54 @@
 All notable changes to this project are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] — Sprint 2: local web app ("buttons")
+
+A local web app over the existing `musicsync` core: FastAPI backend (`musicsync/web/`) + a
+vanilla TypeScript + Vite SPA (`web/`). See `docs/sprint-2-app.md`.
+
+### Added
+- **FastAPI backend** (`musicsync/web/`, presentation layer reusing `SyncService` +
+  `csv_export`): `GET /api/library` (presence + per-platform deep links, search/filter/
+  pagination), `GET /api/auth/{platform}` (connection status), `POST /api/auth/{platform}/connect`,
+  `POST /api/sync` (live dry-run diff), `GET /api/sync/stream` (SSE progress),
+  `POST /api/apply/{platform}` (guarded write), `GET /api/export.csv`.
+- **Vanilla TS + Vite SPA** (`web/`): Connections, Library, and Actions views.
+- **Per-platform link resolver** (`musicsync/web/links.py`): Spotify/Tidal deep links from
+  `presence.platform_id`; Apple uses a `music.apple.com/search` URL.
+- New deps: `fastapi`, `uvicorn`, `sse-starlette`; `httpx` (dev). Node toolchain under `web/`.
+- **Richer track metadata** (closes #12): `album`, `artwork_url`, `duration_sec`, `year` on the
+  `tracks` table and per-platform `added_at` on `presence`, populated on read — Spotify/Tidal get
+  everything incl. artwork; Apple gets album/year/duration/date-added (no artwork via AppleScript).
+  Surfaced in `GET /api/library` (+ `sort_by=added_at`, sorted in SQL) and the Library table
+  (artwork thumbnail, album, year, duration, sortable "Added" column); CSV export gains the
+  columns. Idempotent schema migration (`PRAGMA table_info` + `ALTER TABLE ADD COLUMN`) upgrades
+  an existing `library.db` in place; new fields backfill on the next sync. Identity is unchanged —
+  metadata is display-only; the match key stays name + primary artist.
+- **`Makefile`** with self-documenting targets: `make dev` (backend + SPA together), `install`,
+  `sync`/`apply`/`export`, `gate`, `smoke`, etc.
+
+### Changed
+- **"Sync now" reads only connected platforms.** The web container builds a provider only when
+  its platform is connected (Spotify/Tidal token cached; Apple = `osascript` available), so a
+  live sync never triggers an interactive OAuth or crashes on missing credentials. Unconnected
+  platforms are skipped gracefully.
+- **Read-side graceful degradation generalized** (resolves the Sprint-3 deferred debt): the
+  `graceful_on_apply_error` provider flag is renamed `graceful_on_error` and now governs read
+  *and* apply; a new `SyncOptions.skip_unavailable_providers` lets the web degrade every
+  provider while the CLI keeps its exact behavior (Tidal graceful, Spotify/Apple loud).
+- `SqliteTrackRepository` serializes all connection access behind a re-entrant lock and opens
+  with `check_same_thread=False` (FastAPI runs sync routes in a threadpool); the enriched
+  library query moved into `iter_enriched_rows()` (no raw SQL in the web layer).
+- Shared `build_providers` factory now used by both the CLI and the web container (no
+  duplicated wiring).
+
+### Security
+- Server binds `127.0.0.1` only (never the LAN); `:8080` left free for the OAuth callback.
+- **CSRF protection:** state-changing POSTs require an `X-Requested-With` header (forces a
+  preflight that the localhost-only CORS policy blocks for other origins). CORS narrowed to
+  GET/POST, `allow_credentials` dropped.
+- SPA renders API-sourced text via `textContent`/escaping (no `innerHTML` injection).
+
 ## [Unreleased] — Sprint 3: connector abstraction & cleanup
 
 Pure structural refactor — **no functional behavior change**, guarded by the existing test
