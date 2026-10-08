@@ -42,6 +42,7 @@ def _merge_track_rows(left: Track, right: Track) -> Track:
         artwork_url=left.artwork_url or right.artwork_url,
         duration_sec=left.duration_sec or right.duration_sec,
         year=left.year or right.year,
+        isrc=left.isrc or right.isrc,
     )
 
 
@@ -56,6 +57,7 @@ def _to_canonical_track(track: Track, best_artist: str) -> Track:
         artwork_url=track.artwork_url,
         duration_sec=track.duration_sec,
         year=track.year,
+        isrc=track.isrc,
     )
 
 
@@ -190,6 +192,7 @@ def _track_for_tidal_catalog(
     artwork_url: str | None = None
     duration_sec: int | None = None
     year: str | None = None
+    isrc: str | None = None
 
     for platform in PLATFORMS:
         row = presence_by_platform.get(platform, {}).get(key)
@@ -204,6 +207,8 @@ def _track_for_tidal_catalog(
             year = row.year
         if added_at is None and row.added_at:
             added_at = row.added_at
+        if isrc is None and row.isrc:
+            isrc = row.isrc
         if platform == "tidal" and row.platform_id:
             platform_id = row.platform_id
 
@@ -219,4 +224,5 @@ def _track_for_tidal_catalog(
         artwork_url=artwork_url,
         duration_sec=duration_sec,
         year=year,
+        isrc=isrc,
     )

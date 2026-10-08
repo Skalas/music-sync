@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -194,13 +195,17 @@ def test_tidal_sync_service_skips_write_without_apply_flag(tmp_path: Path) -> No
             return []
 
         def apply_likes(
-            self, tracks: list[Track], *, on_batch: object = None
+            self,
+            tracks: list[Track],
+            *,
+            on_batch: Callable[[list[Track]], None] | None = None,
+            reorder: bool = False,
         ) -> list[Track]:
             nonlocal posted
             posted = True
             return tracks
 
-        def write_review(self, tracks: list[Track], path: object) -> None:
+        def write_review(self, tracks: list[Track], path: Path) -> None:
             pass
 
     db = tmp_path / "lib.db"
@@ -229,11 +234,15 @@ def test_tidal_graceful_degradation_on_auth_failure(
             return [Track(name="Only", artist="Spotify")]
 
         def apply_likes(
-            self, tracks: list[Track], *, on_batch: object = None
+            self,
+            tracks: list[Track],
+            *,
+            on_batch: Callable[[list[Track]], None] | None = None,
+            reorder: bool = False,
         ) -> list[Track]:
             return tracks
 
-        def write_review(self, tracks: list[Track], path: object) -> None:
+        def write_review(self, tracks: list[Track], path: Path) -> None:
             pass
 
     class FakeApple:
@@ -245,11 +254,15 @@ def test_tidal_graceful_degradation_on_auth_failure(
             return []
 
         def apply_likes(
-            self, tracks: list[Track], *, on_batch: object = None
+            self,
+            tracks: list[Track],
+            *,
+            on_batch: Callable[[list[Track]], None] | None = None,
+            reorder: bool = False,
         ) -> list[Track]:
             return tracks
 
-        def write_review(self, tracks: list[Track], path: object) -> None:
+        def write_review(self, tracks: list[Track], path: Path) -> None:
             pass
 
     class FailingTidal:
@@ -261,11 +274,15 @@ def test_tidal_graceful_degradation_on_auth_failure(
             raise TidalError("auth failed")
 
         def apply_likes(
-            self, tracks: list[Track], *, on_batch: object = None
+            self,
+            tracks: list[Track],
+            *,
+            on_batch: Callable[[list[Track]], None] | None = None,
+            reorder: bool = False,
         ) -> list[Track]:
             return []
 
-        def write_review(self, tracks: list[Track], path: object) -> None:
+        def write_review(self, tracks: list[Track], path: Path) -> None:
             pass
 
     db = tmp_path / "lib.db"
@@ -342,14 +359,14 @@ def test_sync_service_checkpoints_partial_tidal_apply(tmp_path: Path) -> None:
             self,
             tracks: list[Track],
             *,
-            on_batch: object = None,
+            on_batch: Callable[[list[Track]], None] | None = None,
             reorder: bool = False,
         ) -> list[Track]:
             if on_batch is not None and tracks:
                 on_batch([tracks[0]])
             raise TidalError("POST /favorites HTTP 429")
 
-        def write_review(self, tracks: list[Track], path: object) -> None:
+        def write_review(self, tracks: list[Track], path: Path) -> None:
             pass
 
     db = tmp_path / "lib.db"
@@ -376,7 +393,7 @@ def test_tidal_batch_409_falls_back_to_individual(tidal_env: Path) -> None:
     session = requests.Session()
 
     def post_side_effect(*args: object, **kwargs: object) -> MagicMock:
-        body = kwargs.get("json") or {}
+        body = cast(dict[str, Any], kwargs.get("json") or {})
         items = body.get("data", [])
         if len(items) > 1:
             return MagicMock(status_code=409)

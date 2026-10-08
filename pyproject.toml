@@ -12,6 +12,8 @@ dependencies = [
     "fastapi>=0.138.1",
     "uvicorn[standard]>=0.49.0",
     "sse-starlette>=3.4.5",
+    "pyjwt>=2.15.1",
+    "cryptography>=50.0.2",
 ]
 
 [project.optional-dependencies]

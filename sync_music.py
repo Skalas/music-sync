@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sqlite3
 import sys
 from pathlib import Path
 
+from musicsync.application.apple_links import resolve_apple_links
 from musicsync.application.csv_export import export_csv
 from musicsync.application.output_paths import (
     APPLESCRIPT_DIR,
@@ -27,8 +29,60 @@ from musicsync.application.output_paths import (
 from musicsync.application.sync_service import SyncOptions, SyncService
 from musicsync.domain.errors import PlatformOperationError
 from musicsync.domain.ports import LibraryProvider
+from musicsync.infrastructure.apple_music_api import build_apple_catalog_client
 from musicsync.infrastructure.providers import build_providers
 from musicsync.infrastructure.sqlite_repository import DatabaseError, SqliteTrackRepository
+
+# Tope por defecto del paso post-sync: la primera corrida sobre una biblioteca grande
+# no se vuelve un rastreo largo; --limit lo sobrescribe y --resolve-apple-links no lo usa.
+POST_SYNC_APPLE_LINK_LIMIT = 200
+
+# Fallos del resolvedor que nunca deben tumbar un sync que ya terminó bien.
+_APPLE_LINK_ERRORS = (PlatformOperationError, sqlite3.Error, DatabaseError)
+
+
+def _positive_int(raw: str) -> int:
+    value = int(raw)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("debe ser un entero positivo")
+    return value
+
+
+def run_apple_link_resolution(
+    repo: SqliteTrackRepository, *, limit: int | None, required: bool
+) -> None:
+    """Batch step: resolve Apple catalog ids. Missing creds → one-line notice, no crash.
+
+    *required* (explicit --resolve-apple-links) turns missing creds or a failed
+    batch into a non-zero exit; after a normal sync they are only reported.
+    """
+    try:
+        _resolve_apple_links(repo, limit=limit, required=required)
+    except _APPLE_LINK_ERRORS as exc:
+        first_line = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+        message = f"Apple Music: links omitidos: {first_line}"
+        if required:
+            sys.exit(message)
+        print(message)
+
+
+def _resolve_apple_links(
+    repo: SqliteTrackRepository, *, limit: int | None, required: bool
+) -> None:
+    client, reason = build_apple_catalog_client(BASE_DIR)
+    if client is None:
+        message = f"Links de Apple Music desactivados: {reason}"
+        if required:
+            sys.exit(message)
+        print(message)
+        return
+    print(f"Resolviendo links de Apple Music (storefront {client.storefront})...")
+    report = resolve_apple_links(repo, client, limit=limit)
+    print(
+        f"Apple Music: {report.resolved} resueltas, {report.unresolved} sin match exacto."
+    )
+    if report.error and required:
+        sys.exit(f"Apple Music: resolución detenida: {report.error}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -87,7 +141,44 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="sin red; opera solo sobre la base de datos",
     )
+    p.add_argument(
+        "--resolve-apple-links",
+        action="store_true",
+        help="solo resuelve ids del catálogo de Apple Music (links exactos) y termina",
+    )
+    p.add_argument(
+        "--limit",
+        type=_positive_int,
+        metavar="N",
+        help="máximo de pistas a resolver en el catálogo de Apple Music por corrida",
+    )
     args = p.parse_args()
+
+    if args.offline and args.resolve_apple_links:
+        p.error("--offline es incompatible con --resolve-apple-links: requiere red.")
+
+    # --resolve-apple-links solo resuelve links y termina: cualquier flag de sync
+    # se ignoraria en silencio, asi que se rechaza explicitamente.
+    if args.resolve_apple_links:
+        sync_flags = [
+            flag
+            for flag, enabled in (
+                ("--apply-spotify", args.apply_spotify),
+                ("--apply-apple", args.apply_apple),
+                ("--apply-tidal", args.apply_tidal),
+                ("--dry-run", args.dry_run),
+                ("--full", args.full),
+                ("--tidal-reorder", args.tidal_reorder),
+                ("--export", args.export is not None),
+            )
+            if enabled
+        ]
+        if sync_flags:
+            p.error(
+                f"--resolve-apple-links es incompatible con {', '.join(sync_flags)}: "
+                "solo resuelve links de Apple Music y no sincroniza. "
+                "Córrelo aparte, sin flags de sync."
+            )
 
     # --offline construye cero proveedores, asi que un --apply-* no tendria a
     # quien aplicar y terminaria en un no-op silencioso con exit 0.
@@ -117,10 +208,19 @@ def main() -> None:
     try:
         repo = SqliteTrackRepository(
             args.db,
-            require_exists=args.offline or args.export is not None,
+            require_exists=(
+                args.offline or args.export is not None or args.resolve_apple_links
+            ),
         )
     except DatabaseError as exc:
         sys.exit(str(exc))
+
+    if args.resolve_apple_links:
+        try:
+            run_apple_link_resolution(repo, limit=args.limit, required=True)
+        finally:
+            repo.close()
+        return
 
     if args.export is not None:
         n = export_csv(repo, args.export)
@@ -162,6 +262,11 @@ def main() -> None:
 
     try:
         service.run(options)
+        if not args.offline and not args.dry_run:
+            post_sync_limit = (
+                args.limit if args.limit is not None else POST_SYNC_APPLE_LINK_LIMIT
+            )
+            run_apple_link_resolution(repo, limit=post_sync_limit, required=False)
     except PlatformOperationError as exc:
         sys.exit(str(exc))
     finally:

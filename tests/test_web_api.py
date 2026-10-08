@@ -142,6 +142,30 @@ class TestLibraryEndpoint:
             assert track["links"]["apple"] is not None
             assert track["links"]["apple"].startswith("https://music.apple.com/search")
 
+    def test_apple_link_uses_stored_catalog_id_without_network(
+        self, seeded_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import requests
+
+        def _no_network(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("web request path must not call the network")
+
+        monkeypatch.setattr(requests.Session, "request", _no_network)
+        key = Track(name="Bohemian Rhapsody", artist="Queen").key
+        repo = SqliteTrackRepository(seeded_db)
+        repo.save_apple_link(
+            key, "1440650428", storefront="sv", resolved_at="2026-10-08T00:00:00+00:00"
+        )
+        repo.close()
+
+        items = TestClient(create_app(db_path=seeded_db, providers=[])).get(
+            "/api/library"
+        ).json()["items"]
+
+        links = {t["name"]: t["links"]["apple"] for t in items}
+        assert links["Bohemian Rhapsody"] == "https://music.apple.com/sv/song/1440650428"
+        assert links["Imagine"].startswith("https://music.apple.com/search")
+
     def test_spotify_link_null_without_platform_id(self, client: TestClient) -> None:
         # Seed data doesn't set platform_id, so Spotify links should be None
         resp = client.get("/api/library")

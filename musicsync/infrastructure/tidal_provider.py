@@ -227,6 +227,7 @@ class TidalProvider:
             artwork_url=track.artwork_url,
             duration_sec=track.duration_sec,
             year=track.year,
+            isrc=track.isrc,
         )
 
     def _resolve_artist_name(
@@ -754,6 +755,7 @@ def _parse_collection_item(
         artwork_url=artwork_url,
         duration_sec=duration_sec,
         year=year,
+        isrc=attrs.get("isrc") or None,
     )
 
 

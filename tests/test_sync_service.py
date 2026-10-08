@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from pathlib import Path
+
 import pytest
 
 from musicsync.application.sync_service import SyncOptions, SyncService
@@ -59,11 +62,15 @@ class _SystemExitProvider:
         raise SystemExit("missing .env creds")
 
     def apply_likes(
-        self, tracks: list[Track], *, on_batch: object = None
+        self,
+        tracks: list[Track],
+        *,
+        on_batch: Callable[[list[Track]], None] | None = None,
+        reorder: bool = False,
     ) -> list[Track]:
         return tracks
 
-    def write_review(self, tracks: list[Track], path: object) -> None:
+    def write_review(self, tracks: list[Track], path: Path) -> None:
         pass
 
 

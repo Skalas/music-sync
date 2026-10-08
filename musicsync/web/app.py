@@ -138,8 +138,8 @@ def _row_to_library_track(row: dict[str, Any]) -> LibraryTrack:
         apple=bool(row["apple"]),
         tidal=bool(row["tidal"]),
     )
-    # Enriched rows carry spotify_id / tidal_id (from iter_enriched_rows) so we
-    # can build deep links; Apple has no stored id and falls back to a search URL.
+    # Enriched rows carry spotify_id / tidal_id / apple_catalog_id (from
+    # iter_enriched_rows) so links come from the DB only — no network here.
     links = TrackLinks(
         spotify=track_url(
             "spotify",
@@ -147,7 +147,14 @@ def _row_to_library_track(row: dict[str, Any]) -> LibraryTrack:
             name=row["name"],
             artist=row["artist"],
         ),
-        apple=track_url("apple", platform_id=None, name=row["name"], artist=row["artist"]) or "",
+        apple=track_url(
+            "apple",
+            platform_id=row.get("apple_catalog_id"),
+            storefront=row.get("apple_storefront"),
+            name=row["name"],
+            artist=row["artist"],
+        )
+        or "",
         tidal=track_url(
             "tidal",
             platform_id=row.get("tidal_id"),

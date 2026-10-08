@@ -117,6 +117,7 @@ class SpotifyProvider:
                                 round(duration_ms / 1000) if duration_ms is not None else None
                             ),
                             year=year_from_date(album_data.get("release_date")),
+                            isrc=(track.get("external_ids") or {}).get("isrc") or None,
                         )
                     )
                     bar.update(1)

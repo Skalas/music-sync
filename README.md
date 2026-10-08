@@ -78,6 +78,37 @@ con **OAuth2 + PKCE**.
 
 ---
 
+## 1c. Links exactos de Apple Music (opcional)
+
+Sin esto, la columna Apple de la web abre una **búsqueda**. Con una clave **MusicKit** la herramienta
+resuelve, en un paso batch, el id de catálogo de cada canción y la web enlaza a
+`https://music.apple.com/{storefront}/song/{id}` (la web nunca llama a la red: lee el id de `library.db`).
+
+1. En **developer.apple.com → Certificates, IDs & Profiles → Keys** crea una clave con **MusicKit**
+   y descarga el `.p8` (solo se descarga una vez).
+2. Guárdalo **fuera del repo**, p. ej. `~/.config/musicsync/AuthKey_XXXX.p8` (`chmod 600`).
+3. En `.env`:
+   ```bash
+   APPLE_TEAM_ID=...          # Team ID de tu cuenta de desarrollador
+   APPLE_KEY_ID=...           # Key ID de la clave MusicKit
+   APPLE_PRIVATE_KEY_PATH=~/.config/musicsync/AuthKey_XXXX.p8
+   APPLE_STOREFRONT=sv        # país de tu catálogo (default: us)
+   ```
+4. Corre `uv run sync_music.py --resolve-apple-links [--limit N]` (sin `--limit` resuelve todo), o
+   simplemente sincroniza: el paso corre al final de cada sync con red, con un tope de 200 canciones
+   por corrida (`--limit` lo cambia), y nunca con `--offline` ni `--dry-run`. Si falla, el sync no falla.
+
+Resolución: primero por **ISRC** (capturado de Spotify/Tidal; prefiere el álbum original sobre
+recopilatorios y la duración más cercana, ±3 s), luego búsqueda por nombre + artista principal
+aceptada solo si coinciden el artista principal, la duración (conocida en ambos lados) y el **título
+de la grabación**. Ambas rutas comparan ese título: se ignoran créditos `feat.`/`with`, etiquetas de
+banda sonora (`From "…"`) y de remasterización/edición (`Remastered 2009`, `Deluxe`), pero
+`Live`, `Remix`, `Acoustic`, `Radio Edit`, `Version`… marcan otra grabación y no se enlazan a la
+original. Ante ambigüedad no se enlaza (queda la búsqueda); lo no encontrado se reintenta a los 30 días. Si faltan credenciales, el paso se omite con
+un aviso de una línea.
+
+---
+
 ## 2. Instalación
 
 ```bash
@@ -178,14 +209,17 @@ permisos de Automatización (Música). Las siguientes son silenciosas e incremen
 | `--db PATH` | Ruta de la base SQLite (por defecto `library.db`). |
 | `--offline` | No usa la red; opera solo sobre `library.db` (para exportar o inspeccionar el diff). |
 | `--dry-run` | Solo reporta el diff; no escribe en ningún lado. |
+| `--resolve-apple-links` | Solo resuelve ids del catálogo de Apple Music (links exactos; ver §1c) y termina. |
+| `--limit N` | Máximo de canciones a resolver en el catálogo de Apple por corrida (post-sync: 200 por defecto). |
 | `--full` | Reconcilia todo desde cero (ignora lo ya marcado como sincronizado). |
 | `--no-apple` | No procesa la dirección hacia Apple Music. |
 | `--no-spotify` | No procesa la dirección hacia Spotify. |
 | `--no-tidal` | Excluye Tidal por completo de la unión. |
 
 **Base de datos (`library.db`, fuente de verdad):**
-- Tabla `tracks` (una fila por canción normalizada) y `presence` (qué plataformas la tienen marcada y
-  cuándo se sincronizó). Sustituye a `state.json`, que se **migra automáticamente** una sola vez.
+- Tabla `tracks` (una fila por canción normalizada, con ISRC cuando la plataforma lo da), `presence`
+  (qué plataformas la tienen marcada y cuándo se sincronizó) y `apple_catalog` (id de catálogo de
+  Apple por canción; `NULL` = no encontrada). Sustituye a `state.json`, que se **migra automáticamente** una sola vez.
 - Inspecciónala con cualquier cliente SQLite, o expórtala con `--export`.
 
 **Archivos generados (ignorados por git, anclados a la raíz del proyecto — no al directorio
@@ -221,7 +255,7 @@ Abre **http://localhost:5173**. Tres vistas:
   viven solo en `.env`.
 - **Library** — tabla desde `library.db`: búsqueda/filtro, carátula, álbum, año, duración y
   "Added" (ordenable por fecha de alta), una columna por plataforma con enlace directo cuando hay
-  `platform_id` (Apple usa enlace de búsqueda), e insignia "on all three".
+  `platform_id` (Apple enlaza a la canción si su id de catálogo está resuelto; si no, a la búsqueda), e insignia "on all three".
 - **Actions** — **Sync now** (dry-run en vivo: lee **solo las plataformas conectadas** y muestra
   el diff; no escribe en remoto), botones **Apply** por plataforma (con confirmación, ruta
   protegida equivalente a `--apply-*`) y **Export CSV**.
