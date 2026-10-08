@@ -9,6 +9,7 @@ import threading
 from pathlib import Path
 
 from musicsync.domain._time import utc_now_iso
+from musicsync.domain.apple_catalog import AppleLinkTarget
 from musicsync.domain.platforms import PLATFORMS
 from musicsync.domain.track import Track, normalize_key
 from musicsync.domain.union import canonicalize_presence
@@ -23,7 +24,8 @@ CREATE TABLE IF NOT EXISTS tracks (
     album TEXT,
     artwork_url TEXT,
     duration_sec INTEGER,
-    year TEXT
+    year TEXT,
+    isrc TEXT
 );
 CREATE TABLE IF NOT EXISTS presence (
     key TEXT NOT NULL,
@@ -33,6 +35,13 @@ CREATE TABLE IF NOT EXISTS presence (
     added_at TEXT,
     synced_at TEXT,
     PRIMARY KEY (key, platform),
+    FOREIGN KEY (key) REFERENCES tracks(key)
+);
+CREATE TABLE IF NOT EXISTS apple_catalog (
+    key TEXT PRIMARY KEY,
+    catalog_id TEXT,
+    storefront TEXT NOT NULL,
+    resolved_at TEXT NOT NULL,
     FOREIGN KEY (key) REFERENCES tracks(key)
 );
 CREATE TABLE IF NOT EXISTS _meta (
@@ -51,6 +60,7 @@ _TRACKS_MIGRATIONS = [
     ("artwork_url", "TEXT"),
     ("duration_sec", "INTEGER"),
     ("year", "TEXT"),
+    ("isrc", "TEXT"),
 ]
 _PRESENCE_MIGRATIONS = [
     ("added_at", "TEXT"),
@@ -63,6 +73,7 @@ _METADATA_COLUMNS = ("album", "artwork_url", "duration_sec", "year")
 def _metadata_from_row(row: sqlite3.Row) -> dict[str, str | int | None]:
     """Extract the four track-level metadata fields from a query row."""
     return {col: row[col] for col in _METADATA_COLUMNS}
+
 
 class DatabaseError(Exception):
     """Raised when the SQLite database cannot be opened or used."""
@@ -164,6 +175,14 @@ class SqliteTrackRepository:
         )
         self._conn.execute(
             """
+            DELETE FROM apple_catalog
+            WHERE key = ?
+              AND NOT EXISTS (SELECT 1 FROM presence WHERE key = apple_catalog.key)
+            """,
+            (title_only_key,),
+        )
+        self._conn.execute(
+            """
             DELETE FROM tracks
             WHERE key = ?
               AND NOT EXISTS (SELECT 1 FROM presence WHERE key = tracks.key)
@@ -176,8 +195,8 @@ class SqliteTrackRepository:
         self._conn.execute(
             """
             INSERT INTO tracks (key, name, artist, first_seen, last_seen,
-                                album, artwork_url, duration_sec, year)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                album, artwork_url, duration_sec, year, isrc)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(key) DO UPDATE SET
                 name = excluded.name,
                 artist = excluded.artist,
@@ -185,7 +204,8 @@ class SqliteTrackRepository:
                 album = COALESCE(excluded.album, album),
                 artwork_url = COALESCE(excluded.artwork_url, artwork_url),
                 duration_sec = COALESCE(excluded.duration_sec, duration_sec),
-                year = COALESCE(excluded.year, year)
+                year = COALESCE(excluded.year, year),
+                isrc = COALESCE(excluded.isrc, isrc)
             """,
             (
                 track.key,
@@ -197,6 +217,7 @@ class SqliteTrackRepository:
                 track.artwork_url,
                 track.duration_sec,
                 track.year,
+                track.isrc,
             ),
         )
 
@@ -293,6 +314,7 @@ class SqliteTrackRepository:
                     artwork_url = COALESCE(?, artwork_url),
                     duration_sec = COALESCE(?, duration_sec),
                     year = COALESCE(?, year),
+                    isrc = COALESCE(isrc, ?),
                     last_seen = ?
                 WHERE key = ?
                 """,
@@ -302,11 +324,13 @@ class SqliteTrackRepository:
                     orphan["artwork_url"],
                     orphan["duration_sec"],
                     orphan["year"],
+                    orphan["isrc"],
                     now,
                     canonical_key,
                 ),
             )
 
+        self._move_apple_link(orphan_key, canonical_key)
         self._conn.execute(
             """
             DELETE FROM tracks WHERE key = ?
@@ -314,6 +338,29 @@ class SqliteTrackRepository:
             """,
             (orphan_key, orphan_key),
         )
+
+    def _move_apple_link(self, orphan_key: str, canonical_key: str) -> None:
+        """Carry the orphan's Apple catalog id over, then drop the orphan row.
+
+        The canonical row wins when it already has an id; a negative (NULL) row
+        never overwrites anything. Caller must hold self._lock.
+        """
+        self._conn.execute(
+            """
+            INSERT INTO apple_catalog (key, catalog_id, storefront, resolved_at)
+            SELECT ?, catalog_id, storefront, resolved_at
+            FROM apple_catalog
+            WHERE key = ? AND catalog_id IS NOT NULL
+              AND EXISTS (SELECT 1 FROM tracks WHERE key = ?)
+            ON CONFLICT(key) DO UPDATE SET
+                catalog_id = excluded.catalog_id,
+                storefront = excluded.storefront,
+                resolved_at = excluded.resolved_at
+            WHERE apple_catalog.catalog_id IS NULL
+            """,
+            (canonical_key, orphan_key, canonical_key),
+        )
+        self._conn.execute("DELETE FROM apple_catalog WHERE key = ?", (orphan_key,))
 
     def get_synced_keys(self, platform: str) -> set[str]:
         with self._lock:
@@ -464,9 +511,12 @@ class SqliteTrackRepository:
                     MAX(CASE WHEN p.platform = 'spotify' THEN p.added_at END) AS spotify_added_at,
                     MAX(CASE WHEN p.platform = 'apple'   THEN p.added_at END) AS apple_added_at,
                     MAX(CASE WHEN p.platform = 'tidal'   THEN p.added_at END) AS tidal_added_at,
-                    MAX(p.added_at) AS added_at_representative
+                    MAX(p.added_at) AS added_at_representative,
+                    a.catalog_id AS apple_catalog_id,
+                    a.storefront AS apple_storefront
                 FROM tracks t
                 LEFT JOIN presence p ON p.key = t.key
+                LEFT JOIN apple_catalog a ON a.key = t.key
                 GROUP BY t.key, t.name, t.artist
                 {order_clause}
                 """
@@ -486,6 +536,58 @@ class SqliteTrackRepository:
                 "apple_added_at": row["apple_added_at"],
                 "tidal_added_at": row["tidal_added_at"],
                 "added_at_representative": row["added_at_representative"],
+                "apple_catalog_id": row["apple_catalog_id"],
+                "apple_storefront": row["apple_storefront"],
             }
             for row in rows
         ]
+
+    def pending_apple_links(
+        self, storefront: str, *, stale_before: str, limit: int | None = None
+    ) -> list[AppleLinkTarget]:
+        """Tracks never resolved for *storefront*, or not found before *stale_before*.
+
+        Never-attempted tracks come first so a ``limit`` makes forward progress.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT t.key, t.name, t.artist, t.album, t.duration_sec, t.isrc
+                FROM tracks t
+                LEFT JOIN apple_catalog a ON a.key = t.key
+                WHERE a.key IS NULL
+                   OR a.storefront != ?
+                   OR (a.catalog_id IS NULL AND a.resolved_at < ?)
+                ORDER BY a.key IS NOT NULL, t.key
+                LIMIT ?
+                """,
+                (storefront, stale_before, -1 if limit is None else limit),
+            ).fetchall()
+        return [
+            AppleLinkTarget(
+                key=row["key"],
+                name=row["name"],
+                artist=row["artist"],
+                album=row["album"],
+                duration_sec=row["duration_sec"],
+                isrc=row["isrc"],
+            )
+            for row in rows
+        ]
+
+    def save_apple_link(
+        self, key: str, catalog_id: str | None, *, storefront: str, resolved_at: str
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO apple_catalog (key, catalog_id, storefront, resolved_at)
+                SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM tracks WHERE key = ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    catalog_id = excluded.catalog_id,
+                    storefront = excluded.storefront,
+                    resolved_at = excluded.resolved_at
+                """,
+                (key, catalog_id, storefront, resolved_at, key),
+            )
+            self._conn.commit()
