@@ -16,6 +16,7 @@ _NOISE_RE = re.compile(
 )
 _NONALNUM_RE = re.compile(r"[^a-z0-9 ]+")
 _WS_RE = re.compile(r"\s+")
+_PRIMARY_ARTIST_RE = re.compile(r"[,&;/]| feat")
 
 
 def _normalize_field(value: str) -> str:
@@ -42,10 +43,19 @@ def date_only(raw: str | None) -> str | None:
     return raw[:10] if len(raw) >= 10 else raw
 
 
+def primary_artist(artist: str) -> str:
+    """Primer artista acreditado: lo que precede a ',', '&', ';', '/' o ' feat'.
+
+    Las plataformas acreditan colaboraciones de formas distintas ("Azealia Banks,
+    Lazy Jay" vs "Azealia Banks"), asi que el artista principal es la unica parte
+    comparable entre servicios.
+    """
+    return _PRIMARY_ARTIST_RE.split(artist or "", maxsplit=1)[0].strip()
+
+
 def normalize_key(name: str, artist: str) -> str:
     """Clave heuristica para emparejar canciones entre servicios."""
-    primary_artist = re.split(r"[,&;/]| feat", artist or "", maxsplit=1)[0]
-    return f"{_normalize_field(name)}{KEY_SEP}{_normalize_field(primary_artist)}"
+    return f"{_normalize_field(name)}{KEY_SEP}{_normalize_field(primary_artist(artist))}"
 
 
 @dataclass

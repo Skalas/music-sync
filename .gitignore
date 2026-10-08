@@ -30,3 +30,11 @@ __pycache__/
 # Frontend build artifacts
 web/node_modules/
 web/dist/
+# metate transient session-id capture buffer
+.metate/.session-start.json
+# metate release plan (aftercare → ship)
+.metate/release.json
+# metate reviewer agents are installed tooling (source: metate repo)
+.cursor/agents/metate-*.md
+# metate DoD ledger (per-sprint; start overwrites)
+.metate/dod.json

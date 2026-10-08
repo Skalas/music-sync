@@ -19,7 +19,7 @@ TIDAL (Favorites) ──OAuth2 API─────────┘
         │                                                                      │
         ├─ exportable a CSV (--export)                                         │
         │                                                                      ▼
-        └─ faltan en Apple   → Atajo + Love        (--apply-apple)
+        └─ faltan en Apple   → Love; Atajo solo si falta importar (--apply-apple)
            faltan en Spotify → API agrega like     (--apply-spotify)
            faltan en Tidal   → API add favorite    (--apply-tidal)
 ```
@@ -91,8 +91,13 @@ uv sync                 # instala deps de runtime + dev (pytest, ruff, mypy) des
 ## 3. Crear el Atajo `SyncToAppleMusic` en Atajos.app
 
 El Atajo hace **una sola cosa**: tomar una lista de canciones, buscarlas en la tienda de Apple Music y
-añadirlas a tu biblioteca. (El marcar "Favorita/Love" lo hace después un AppleScript, porque Atajos no
-lo hace de forma confiable.)
+añadirlas a tu biblioteca. Es el único paso que AppleScript **no puede** hacer: el comando `add` del
+diccionario de Music solo acepta *archivos locales* y `search` está limitado a `library.read`, así que
+ninguno alcanza el catálogo de Apple Music. Marcar "Favorita/Love" sí lo hace AppleScript.
+
+Por eso `--apply-apple` va en dos fases: primero marca Favorita todo lo que **ya está** en tu
+biblioteca (solo AppleScript) y solo después ejecuta el Atajo con lo que realmente falta importar. Si
+tu biblioteca ya se solapa con Spotify/Tidal, el Atajo **no se ejecuta** en la mayoría de las corridas.
 
 **Pasos (créalo visualmente una vez):**
 
@@ -125,6 +130,23 @@ shortcuts run "SyncToAppleMusic" -i /tmp/test.txt
 ```
 Revisa que esas canciones aparezcan en tu biblioteca de Música.
 
+> **El Atajo falla en silencio.** `shortcuts run` devuelve **exit 0** aunque el Atajo no agregue
+> nada: no hay ningun error que lo delate. Verifica siempre por el resultado, no por el codigo de
+> salida — que las canciones aparezcan de verdad en la biblioteca.
+>
+> Diagnostico, en este orden (comprobado: la busqueda en si funciona; la API publica de iTunes
+> devuelve el track correcto incluso con el separador " - " en la consulta):
+> 1. Ejecuta el Atajo **a mano** desde Atajos.app (▶) con una cancion conocida. Si a mano funciona
+>    y por CLI no, el problema es el runner headless de `shortcuts run`, no el Atajo.
+> 2. Revisa que la accion de agregar sea **"Añadir a la biblioteca"** y no "Añadir a lista de
+>    reproduccion": un producto de la tienda puede necesitar entrar a la biblioteca primero.
+> 3. Toca la variable de entrada de esa accion y confirma que apunta al resultado de la busqueda
+>    de la iteracion actual (una variable rota se sigue mostrando como token pero no resuelve).
+>
+> Por eso `--apply-apple` verifica la biblioteca **despues** del Atajo y solo registra como
+> sincronizado lo que confirma; un Atajo que no agrega deja las canciones pendientes en vez de
+> marcarlas como hechas.
+
 ---
 
 ## 4. Uso
@@ -150,7 +172,7 @@ permisos de Automatización (Música). Las siguientes son silenciosas e incremen
 | Flag | Efecto |
 |---|---|
 | `--apply-spotify` | Aplica realmente los likes nuevos en Spotify (requiere scope de escritura). |
-| `--apply-apple` | Aplica realmente las altas en Apple Music (Atajo + Love). |
+| `--apply-apple` | Aplica las altas en Apple Music: marca Favorita lo que ya está en la biblioteca y ejecuta el Atajo solo si falta importar algo. |
 | `--apply-tidal` | Aplica realmente las altas en Tidal Favorites (requiere scope de escritura). |
 | `--export PATH.csv` | Exporta toda la biblioteca a CSV (una fila por canción, una columna por plataforma) y termina. |
 | `--db PATH` | Ruta de la base SQLite (por defecto `library.db`). |
@@ -169,7 +191,8 @@ permisos de Automatización (Música). Las siguientes son silenciosas e incremen
 **Archivos generados (ignorados por git, anclados a la raíz del proyecto — no al directorio
 desde el que ejecutes):**
 - `library.db` — base SQLite, fuente de verdad (presencia por plataforma + estado de sync).
-- `canciones_to_apple.txt` — entrada del Atajo / lista de revisión para Apple.
+- `canciones_to_apple.txt` — lista de revisión para Apple; al aplicar contiene **solo** las canciones
+  que faltan importar del catálogo (las que ya estaban en la biblioteca no pasan por el Atajo).
 - `to_spotify_review.txt` — candidatos a agregar en Spotify, para revisar.
 - `unmatched.log` — canciones sin match cross-service.
 - `.tidal-cache` — token OAuth de Tidal (escrito de forma atómica con permisos `0600`).
@@ -222,3 +245,8 @@ Notas:
   orden por fecha de like (`added_at`) pero su posición final en la biblioteca la decide Music.app.
 - La propiedad de favorita cambió de `loved` a `favorited` entre versiones de macOS; el AppleScript
   maneja ambas con fallback.
+- **Apple no confirma importaciones:** el Atajo no reporta qué encontró en la tienda. Para no marcar
+  como sincronizado algo que no llegó, tras el Atajo se vuelve a consultar la biblioteca y solo las
+  canciones **verificadas** se registran como aplicadas; el resto se reintenta en la próxima corrida.
+- **Apple no tiene id estable:** sin la API de Apple Music no hay `platform_id`, así que los enlaces
+  profundos de Apple son URLs de búsqueda.

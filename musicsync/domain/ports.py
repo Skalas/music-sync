@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -22,8 +23,21 @@ class LibraryProvider(Protocol):
         """Return all liked/favorite tracks from the remote library."""
         ...
 
-    def apply_likes(self, tracks: list[Track]) -> list[Track]:
-        """Apply likes on the platform. Returns tracks successfully synced."""
+    def apply_likes(
+        self,
+        tracks: list[Track],
+        *,
+        on_batch: Callable[[list[Track]], None] | None = None,
+        reorder: bool = False,
+    ) -> list[Track]:
+        """Apply likes on the platform. Returns tracks successfully synced.
+
+        *on_batch* is invoked after each durable batch (when supported) so the
+        caller can checkpoint ``synced_at`` before the full run finishes.
+
+        *reorder* (Tidal only): remove then re-add in *tracks* order so the
+        remote favorites list matches chronological intent.
+        """
         ...
 
     def write_review(self, tracks: list[Track], path: Path) -> None:
@@ -80,4 +94,8 @@ class TrackRepository(Protocol):
 
         When sort_by='added_at', rows are ordered most-recently-added first.
         """
+        ...
+
+    def dedupe_title_only_keys(self) -> int:
+        """Merge title-only keys into canonical keys with the same normalized title."""
         ...

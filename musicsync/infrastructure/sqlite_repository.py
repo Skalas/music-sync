@@ -10,7 +10,8 @@ from pathlib import Path
 
 from musicsync.domain._time import utc_now_iso
 from musicsync.domain.platforms import PLATFORMS
-from musicsync.domain.track import Track
+from musicsync.domain.track import Track, normalize_key
+from musicsync.domain.union import canonicalize_presence
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS tracks (
@@ -129,6 +130,7 @@ class SqliteTrackRepository:
         with self._lock:
             now = utc_now_iso()
             for track in tracks:
+                self._drop_title_only_duplicate(platform, track)
                 self._upsert_track(track, now)
                 self._conn.execute(
                     """
@@ -148,6 +150,26 @@ class SqliteTrackRepository:
                     ),
                 )
             self._conn.commit()
+
+    def _drop_title_only_duplicate(self, platform: str, track: Track) -> None:
+        """Remove stale title-only presence when artist metadata is now known."""
+        if not track.artist.strip():
+            return
+        title_only_key = normalize_key(track.name, "")
+        if title_only_key == track.key:
+            return
+        self._conn.execute(
+            "DELETE FROM presence WHERE key = ? AND platform = ?",
+            (title_only_key, platform),
+        )
+        self._conn.execute(
+            """
+            DELETE FROM tracks
+            WHERE key = ?
+              AND NOT EXISTS (SELECT 1 FROM presence WHERE key = tracks.key)
+            """,
+            (title_only_key,),
+        )
 
     def _upsert_track(self, track: Track, now: str) -> None:
         """Insert or update the track row. Caller must hold self._lock."""
@@ -201,6 +223,97 @@ class SqliteTrackRepository:
                 added_at=row["added_at"],
             )
         return result
+
+    def dedupe_title_only_keys(self) -> int:
+        presence = self.get_liked_by_platform()
+        _canonical, key_remap = canonicalize_presence(presence)
+        return self.merge_keys(key_remap)
+
+    def merge_keys(self, key_remap: dict[str, str]) -> int:
+        if not key_remap:
+            return 0
+        count = 0
+        with self._lock:
+            for old_key, canonical_key in key_remap.items():
+                if old_key == canonical_key:
+                    continue
+                self._merge_key_into(old_key, canonical_key)
+                count += 1
+            if count:
+                self._conn.commit()
+        return count
+
+    def _merge_key_into(self, orphan_key: str, canonical_key: str) -> None:
+        orphan = self._conn.execute(
+            "SELECT * FROM tracks WHERE key = ?", (orphan_key,)
+        ).fetchone()
+        if orphan is None:
+            return
+
+        for row in self._conn.execute(
+            """
+            SELECT platform, liked, platform_id, added_at, synced_at
+            FROM presence WHERE key = ?
+            """,
+            (orphan_key,),
+        ).fetchall():
+            self._conn.execute(
+                """
+                INSERT INTO presence (key, platform, liked, platform_id, added_at, synced_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(key, platform) DO UPDATE SET
+                    liked = CASE WHEN excluded.liked = 1 OR liked = 1 THEN 1 ELSE 0 END,
+                    platform_id = COALESCE(excluded.platform_id, platform_id),
+                    added_at = COALESCE(excluded.added_at, added_at),
+                    synced_at = COALESCE(excluded.synced_at, synced_at)
+                """,
+                (
+                    canonical_key,
+                    row["platform"],
+                    row["liked"],
+                    row["platform_id"],
+                    row["added_at"],
+                    row["synced_at"],
+                ),
+            )
+
+        self._conn.execute("DELETE FROM presence WHERE key = ?", (orphan_key,))
+
+        canonical = self._conn.execute(
+            "SELECT * FROM tracks WHERE key = ?", (canonical_key,)
+        ).fetchone()
+        if canonical is not None:
+            now = utc_now_iso()
+            best_artist = (canonical["artist"] or "").strip() or (orphan["artist"] or "")
+            self._conn.execute(
+                """
+                UPDATE tracks SET
+                    artist = ?,
+                    album = COALESCE(?, album),
+                    artwork_url = COALESCE(?, artwork_url),
+                    duration_sec = COALESCE(?, duration_sec),
+                    year = COALESCE(?, year),
+                    last_seen = ?
+                WHERE key = ?
+                """,
+                (
+                    best_artist,
+                    orphan["album"],
+                    orphan["artwork_url"],
+                    orphan["duration_sec"],
+                    orphan["year"],
+                    now,
+                    canonical_key,
+                ),
+            )
+
+        self._conn.execute(
+            """
+            DELETE FROM tracks WHERE key = ?
+              AND NOT EXISTS (SELECT 1 FROM presence WHERE key = ?)
+            """,
+            (orphan_key, orphan_key),
+        )
 
     def get_synced_keys(self, platform: str) -> set[str]:
         with self._lock:

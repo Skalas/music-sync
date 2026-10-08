@@ -26,7 +26,9 @@ from musicsync.application.output_paths import (
 from musicsync.application.sync_service import SyncService
 from musicsync.domain.ports import LibraryProvider
 from musicsync.infrastructure.providers import build_providers
+from musicsync.infrastructure.spotify_provider import SpotifyProvider
 from musicsync.infrastructure.sqlite_repository import SqliteTrackRepository
+from musicsync.infrastructure.tidal_provider import TidalProvider
 
 
 def connection_status(platform: str, base_dir: Path = BASE_DIR) -> tuple[bool, bool]:
@@ -76,7 +78,11 @@ class Container:
     sync_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
-def _build_providers() -> list[LibraryProvider]:
+def _build_providers(
+    *,
+    need_write_spotify: bool = False,
+    need_write_tidal: bool = False,
+) -> list[LibraryProvider]:
     """Construct only providers whose platform is actually CONNECTED.
 
     The web app must read only platforms that are set up, so unconnected
@@ -91,11 +97,54 @@ def _build_providers() -> list[LibraryProvider]:
         output_path=TO_APPLE_PATH,
         unmatched_log_path=UNMATCHED_LOG_PATH,
         need_write=False,
+        need_write_spotify=need_write_spotify,
+        need_write_tidal=need_write_tidal,
         skip_on_error=True,
         include_spotify=connected["spotify"],
         include_apple=connected["apple"],
         include_tidal=connected["tidal"],
     )
+
+
+def _upgrade_write_scope(
+    providers: list[LibraryProvider], platform: str
+) -> list[LibraryProvider]:
+    """Swap the apply target for a write-scoped OAuth instance when applicable."""
+    upgraded: list[LibraryProvider] = []
+    for provider in providers:
+        if provider.name != platform:
+            upgraded.append(provider)
+            continue
+        if platform == "spotify" and isinstance(provider, SpotifyProvider):
+            upgraded.append(
+                SpotifyProvider(
+                    base_dir=provider._base_dir,  # noqa: SLF001
+                    unmatched_log_path=provider._unmatched_log_path,  # noqa: SLF001
+                    need_write=True,
+                )
+            )
+        elif platform == "tidal" and isinstance(provider, TidalProvider):
+            upgraded.append(
+                TidalProvider(
+                    base_dir=provider._base_dir,  # noqa: SLF001
+                    need_write=True,
+                )
+            )
+        else:
+            upgraded.append(provider)
+    return upgraded
+
+
+def build_sync_service_for_apply(container: Container, platform: str) -> SyncService:
+    """SyncService wired with write OAuth scope for the platform being applied."""
+    if container.providers:
+        providers = _upgrade_write_scope(container.providers, platform)
+    else:
+        providers = _build_providers(
+            need_write_spotify=(platform == "spotify"),
+            need_write_tidal=(platform == "tidal"),
+        )
+    return SyncService(container.repo, providers, state_json_path=STATE_PATH)
 
 
 def build_container(
