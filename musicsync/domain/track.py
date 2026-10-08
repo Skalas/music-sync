@@ -27,6 +27,89 @@ def _normalize_field(value: str) -> str:
     return _WS_RE.sub(" ", value).strip()
 
 
+def normalize_text(value: str) -> str:
+    """Normalize free text (titles, albums) the same way the match key does."""
+    return _normalize_field(value)
+
+
+# --- Recording title -------------------------------------------------------
+# A title decoration is a bracketed segment ("(feat. X)", "[Remastered]") or a
+# " - " suffix ("- From \"Shrek 2\" Soundtrack"). Decorations that do not change
+# the recording are dropped; everything else (live, remix, acoustic...) is kept.
+
+_BRACKET_SEGMENT_RE = re.compile(r"[\(\[]([^\(\)\[\]]*)[\)\]]")
+_DASH_SEPARATOR = " - "
+
+FEATURE_CREDIT_RE = re.compile(r"^(feat|ft|featuring|with)\b")
+"""Featured-artist credit: same recording, credited differently per platform."""
+
+SOURCE_TAG_RE = re.compile(r"^from\b|\bsoundtrack\b|\bmotion picture\b")
+"""Soundtrack/source tag ("From \"Black Panther\"", "from the motion picture ...")."""
+
+EDITION_TAG_RE = re.compile(
+    r"(\d{4} )?(digital(ly)? )?remaster(ed)?( \d{4})?|deluxe( edition)?|mono|stereo"
+)
+"""Remaster/edition tag, matched against the WHOLE decoration."""
+
+RECORDING_MARKER_RE = re.compile(
+    r"\b(live|remix|mix|acoustic|edit|instrumental|demo|extended|version|cover|"
+    r"karaoke|sped up|slowed)\b"
+)
+"""Markers of a different recording: a decoration carrying one is always kept."""
+
+
+def _fold(value: str) -> str:
+    value = _NONALNUM_RE.sub(" ", value)
+    return _WS_RE.sub(" ", value).strip()
+
+
+def _is_neutral_decoration(segment: str) -> bool:
+    """A recording marker anywhere wins, even inside a credit ("feat. Sia - Alesso Remix").
+
+    Trade-off: a credit naming an artist with a marker word ("feat. Mix Master
+    Mike") is kept too — a false negative (stays unresolved), never a wrong link.
+    """
+    folded = _fold(segment)
+    if RECORDING_MARKER_RE.search(folded):
+        return False
+    return bool(
+        FEATURE_CREDIT_RE.match(folded)
+        or SOURCE_TAG_RE.search(folded)
+        or EDITION_TAG_RE.fullmatch(folded)
+    )
+
+
+def _strip_neutral_brackets(value: str) -> str:
+    return _BRACKET_SEGMENT_RE.sub(
+        lambda m: " " if _is_neutral_decoration(m.group(1)) else f" {m.group(1)} ", value
+    )
+
+
+def _strip_neutral_suffixes(value: str) -> str:
+    head, *suffixes = value.split(_DASH_SEPARATOR)
+    kept = [s for s in suffixes if not _is_neutral_decoration(s)]
+    return " ".join([head, *kept])
+
+
+def normalize_recording_title(value: str) -> str:
+    """Title that identifies the *recording*: same on both platforms or a different song.
+
+    Folds accents, case, punctuation and whitespace, and drops recording-neutral
+    decorations (featured-artist credits, soundtrack/source tags, remaster/deluxe/
+    mono/stereo tags). Recording-changing markers (live, remix, acoustic, edit,
+    instrumental, demo, extended, version, cover, karaoke, sped up/slowed) are
+    kept, so "Song (Live)" never equals "Song".
+    """
+    value = unidecode(value or "").lower()
+    value = _strip_neutral_suffixes(_strip_neutral_brackets(value))
+    return _fold(value)
+
+
+def match_artist(artist: str) -> str:
+    """Artist half of the match key: the normalized primary artist."""
+    return _normalize_field(primary_artist(artist))
+
+
 def year_from_date(raw: str | None) -> str | None:
     """Return the 4-digit year prefix of an ISO-style date string, or None."""
     return raw[:4] if raw else None
@@ -55,7 +138,7 @@ def primary_artist(artist: str) -> str:
 
 def normalize_key(name: str, artist: str) -> str:
     """Clave heuristica para emparejar canciones entre servicios."""
-    return f"{_normalize_field(name)}{KEY_SEP}{_normalize_field(primary_artist(artist))}"
+    return f"{_normalize_field(name)}{KEY_SEP}{match_artist(artist)}"
 
 
 @dataclass
@@ -69,6 +152,7 @@ class Track:
     artwork_url: str | None = None
     duration_sec: int | None = None
     year: str | None = None
+    isrc: str | None = None
 
     def __post_init__(self) -> None:
         self.key = normalize_key(self.name, self.artist)
