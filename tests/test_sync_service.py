@@ -40,6 +40,9 @@ class _FakeRepo:
     ) -> list[dict[str, str | int | None]]:
         return []
 
+    def dedupe_title_only_keys(self) -> int:
+        return 0
+
 
 class _SystemExitProvider:
     """Provider that calls sys.exit() on read (like SpotifyProvider w/o creds)."""
@@ -55,7 +58,9 @@ class _SystemExitProvider:
         self.read_liked_calls += 1
         raise SystemExit("missing .env creds")
 
-    def apply_likes(self, tracks: list[Track]) -> list[Track]:
+    def apply_likes(
+        self, tracks: list[Track], *, on_batch: object = None
+    ) -> list[Track]:
         return tracks
 
     def write_review(self, tracks: list[Track], path: object) -> None:

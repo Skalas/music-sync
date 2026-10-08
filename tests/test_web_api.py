@@ -13,8 +13,11 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from musicsync.domain.errors import PlatformOperationError
 from musicsync.domain.platforms import PLATFORMS
+from musicsync.domain.track import Track
 from musicsync.infrastructure.seed import seed_db
+from musicsync.infrastructure.sqlite_repository import SqliteTrackRepository
 from musicsync.web.app import create_app
 from musicsync.web.container import Container, build_container
 
@@ -65,7 +68,9 @@ class _RecordingReadProvider:
         self.read_liked_calls += 1
         return []
 
-    def apply_likes(self, tracks: list[Any]) -> list[Any]:
+    def apply_likes(
+        self, tracks: list[Any], *, on_batch: Any = None, reorder: bool = False
+    ) -> list[Any]:
         return tracks
 
     def write_review(self, tracks: list[Any], path: Any) -> None:
@@ -506,17 +511,27 @@ class _MockProvider:
         self.name = name
         self.apply_likes_calls: list[Any] = []
         self.read_liked_calls = 0
+        self.write_review_calls = 0
 
     def read_liked(self) -> list[Any]:
         self.read_liked_calls += 1
         return []
 
-    def apply_likes(self, tracks: list[Any]) -> list[Any]:
+    def apply_likes(
+        self, tracks: list[Any], *, on_batch: Any = None, reorder: bool = False
+    ) -> list[Any]:
         self.apply_likes_calls.append(tracks)
         return tracks
 
     def write_review(self, tracks: list[Any], path: Any) -> None:
-        pass
+        self.write_review_calls += 1
+
+
+class _FailingApplyProvider(_MockProvider):
+    def apply_likes(
+        self, tracks: list[Any], *, on_batch: Any = None, reorder: bool = False
+    ) -> list[Any]:
+        raise PlatformOperationError("platform write failed")
 
 
 class TestApplyEndpoint:
@@ -589,6 +604,62 @@ class TestApplyEndpoint:
 
         assert resp.status_code == 200
         assert resp.json()["platform"] == "tidal"
+
+    def test_apply_tidal_skips_other_platform_review_writes(self, tmp_path: Path) -> None:
+        """Web apply for one platform must not write review files for others."""
+        db = tmp_path / "library.db"
+        repo = SqliteTrackRepository(db)
+        tidal_only = Track(name="Tidal Fave", artist="Artist")
+        repo.upsert_presence("tidal", [tidal_only], liked=True)
+        repo.close()
+
+        mock_spotify = _MockProvider("spotify")
+        mock_tidal = _MockProvider("tidal")
+        app = create_app(db_path=db, providers=[mock_spotify, mock_tidal])
+        client = TestClient(app)
+
+        client.post("/api/apply/tidal", headers=XHR_HEADERS)
+
+        assert mock_spotify.write_review_calls == 0
+
+    def test_apply_platform_error_returns_http_error(self, tmp_path: Path) -> None:
+        db = tmp_path / "library.db"
+        repo = SqliteTrackRepository(db)
+        repo.upsert_presence("spotify", [Track(name="Only Spotify", artist="Band")])
+        repo.close()
+        app = create_app(db_path=db, providers=[_FailingApplyProvider("tidal")])
+        client = TestClient(app)
+
+        resp = client.post("/api/apply/tidal", headers=XHR_HEADERS)
+
+        assert resp.status_code == 500
+        assert resp.json()["detail"] == "platform write failed"
+
+    def test_apply_spotify_builds_write_scoped_provider(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import musicsync.web.container as container_mod
+        from musicsync.infrastructure.spotify_provider import SpotifyProvider
+
+        monkeypatch.setenv("SPOTIPY_CLIENT_ID", "id")
+        monkeypatch.setenv("SPOTIPY_CLIENT_SECRET", "secret")
+        monkeypatch.setenv("SPOTIPY_REDIRECT_URI", "http://127.0.0.1:8080")
+        (tmp_path / ".env").write_text("", encoding="utf-8")
+
+        read_only = SpotifyProvider(
+            base_dir=tmp_path,
+            unmatched_log_path=tmp_path / "unmatched.log",
+            need_write=False,
+        )
+        container = build_container(
+            db_path=tmp_path / "lib.db",
+            providers=[read_only],
+        )
+        service = container_mod.build_sync_service_for_apply(container, "spotify")
+        spotify = next(p for p in service._providers.values() if p.name == "spotify")
+
+        assert isinstance(spotify, SpotifyProvider)
+        assert spotify._need_write is True  # noqa: SLF001
 
 
 # ---------------------------------------------------------------------------

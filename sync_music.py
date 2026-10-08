@@ -25,6 +25,7 @@ from musicsync.application.output_paths import (
     UNMATCHED_LOG_PATH,
 )
 from musicsync.application.sync_service import SyncOptions, SyncService
+from musicsync.domain.errors import PlatformOperationError
 from musicsync.domain.ports import LibraryProvider
 from musicsync.infrastructure.providers import build_providers
 from musicsync.infrastructure.sqlite_repository import DatabaseError, SqliteTrackRepository
@@ -40,12 +41,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--apply-apple",
         action="store_true",
-        help="aplica realmente las altas en Apple Music (Atajo + Love)",
+        help="aplica realmente las altas en Apple Music (Love; Atajo solo si falta importar)",
     )
     p.add_argument(
         "--apply-tidal",
         action="store_true",
         help="aplica realmente las altas en Tidal Favorites (scope de escritura)",
+    )
+    p.add_argument(
+        "--tidal-reorder",
+        action="store_true",
+        help="con --apply-tidal: quita y vuelve a añadir TODO el catálogo en orden cronológico",
     )
     p.add_argument(
         "--full",
@@ -81,7 +87,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="sin red; opera solo sobre la base de datos",
     )
-    return p.parse_args()
+    args = p.parse_args()
+
+    # --offline construye cero proveedores, asi que un --apply-* no tendria a
+    # quien aplicar y terminaria en un no-op silencioso con exit 0.
+    if args.offline:
+        conflicting = [
+            flag
+            for flag, enabled in (
+                ("--apply-spotify", args.apply_spotify),
+                ("--apply-apple", args.apply_apple),
+                ("--apply-tidal", args.apply_tidal),
+            )
+            if enabled
+        ]
+        if conflicting:
+            p.error(
+                f"--offline es incompatible con {', '.join(conflicting)}: "
+                "sin red no hay proveedor al que aplicar. "
+                "Usa --dry-run para ver el diff, o quita --offline para aplicar."
+            )
+    return args
 
 
 def main() -> None:
@@ -126,6 +152,7 @@ def main() -> None:
         dry_run=args.dry_run,
         full=args.full,
         offline=args.offline,
+        tidal_reorder=args.tidal_reorder and args.apply_tidal,
     )
 
     service = SyncService(repo, providers, state_json_path=STATE_PATH)
@@ -133,8 +160,12 @@ def main() -> None:
     if not args.offline:
         print("Leyendo fuentes...")
 
-    service.run(options)
-    repo.close()
+    try:
+        service.run(options)
+    except PlatformOperationError as exc:
+        sys.exit(str(exc))
+    finally:
+        repo.close()
     print("\nListo.")
 
 

@@ -1,35 +1,47 @@
--- Marca como Favorita/Love en Apple Music cada cancion de un archivo de texto.
--- Uso: osascript mark_loved.applescript /ruta/al/archivo.txt
--- Cada linea tiene el formato "Nombre - Artista". El artista es el texto despues
--- del ultimo " - " (asi los nombres con guiones se preservan).
+-- Marca como Favorita/Love las canciones que YA existen en la biblioteca.
+-- Uso: osascript mark_loved.applescript /ruta/al/archivo.tsv
+--
+-- Entrada: una linea por cancion, campos separados por TAB:
+--   nombre TAB artista
+-- (TAB en vez de " - " porque los titulos con guiones rompen el parseo:
+--  "Song - Live" se partia en nombre "Song" y artista "Live".)
+--
+-- Salida: una linea por cada linea de entrada, en el MISMO orden:
+--   OK      TAB nombre TAB artista  -> estaba en la biblioteca y quedo marcada
+--   MISSING TAB nombre TAB artista  -> no esta en la biblioteca (hay que importarla)
+--   ERROR   TAB nombre TAB artista  -> estaba, pero no se pudo marcar
+--
+-- El llamador (apple_provider.py) alinea salida con entrada POR INDICE, asi que
+-- la correspondencia 1:1 de lineas es parte del contrato de este script.
 
 on run argv
-	if (count of argv) is 0 then return "ERROR: falta la ruta del archivo"
+	if (count of argv) is 0 then error "falta la ruta del archivo"
 	set filePath to item 1 of argv
 
-	set fileText to read (POSIX file filePath) as «class utf8»
-	set theLines to paragraphs of fileText
+	-- Se resuelven fuera del bloque `tell` para que no compitan con los
+	-- terminos del diccionario de Music.
+	set TABCH to tab
+	set LFCH to linefeed
 
-	set marked to 0
-	set missed to 0
+	set fileText to read (POSIX file filePath) as «class utf8»
+	set inputLines to paragraphs of fileText
+
+	set out to ""
 
 	tell application "Music"
-		repeat with aLine in theLines
+		repeat with aLine in inputLines
 			set lineStr to (aLine as text)
 			if lineStr is not "" then
-				-- Separar "Nombre - Artista" por el ultimo " - "
-				set AppleScript's text item delimiters to " - "
+				set AppleScript's text item delimiters to TABCH
 				set parts to text items of lineStr
+				set AppleScript's text item delimiters to ""
+
+				set theName to item 1 of parts
 				if (count of parts) >= 2 then
-					set theArtist to (item -1 of parts)
-					set nameParts to items 1 thru -2 of parts
-					set AppleScript's text item delimiters to " - "
-					set theName to (nameParts as text)
+					set theArtist to item 2 of parts
 				else
-					set theName to lineStr
 					set theArtist to ""
 				end if
-				set AppleScript's text item delimiters to ""
 
 				set hits to {}
 				try
@@ -44,21 +56,25 @@ on run argv
 				end try
 
 				if (count of hits) > 0 then
-					set t to item 1 of hits
+					set theStatus to "OK"
 					try
-						set favorited of t to true
+						set favorited of (item 1 of hits) to true
 					on error
+						-- `loved` es el nombre de la propiedad en macOS anteriores.
 						try
-							set loved of t to true
+							set loved of (item 1 of hits) to true
+						on error
+							set theStatus to "ERROR"
 						end try
 					end try
-					set marked to marked + 1
 				else
-					set missed to missed + 1
+					set theStatus to "MISSING"
 				end if
+
+				set out to out & theStatus & TABCH & theName & TABCH & theArtist & LFCH
 			end if
 		end repeat
 	end tell
 
-	return "marcadas: " & marked & " | no encontradas: " & missed
+	return out
 end run

@@ -72,6 +72,10 @@ export interface ApplyResult {
   applied: number;
 }
 
+export interface ApplyRequest {
+  reorder?: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Platform metadata — single source of truth for the three views
 // ---------------------------------------------------------------------------
@@ -156,10 +160,14 @@ export function postSync(body: SyncRequest = {}): Promise<SyncDiff> {
   });
 }
 
-export function applyPlatform(platform: string): Promise<ApplyResult> {
+export function applyPlatform(
+  platform: string,
+  body: ApplyRequest = {},
+): Promise<ApplyResult> {
   return apiFetch<ApplyResult>(`/api/apply/${platform}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   });
 }
 

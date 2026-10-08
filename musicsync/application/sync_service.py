@@ -8,10 +8,17 @@ from pathlib import Path
 
 from musicsync.application.output_paths import TO_APPLE_PATH, TO_SPOTIFY_REVIEW_PATH
 from musicsync.domain._time import utc_now_iso
+from musicsync.domain.errors import PlatformOperationError
 from musicsync.domain.platforms import PLATFORMS
 from musicsync.domain.ports import LibraryProvider, TrackRepository
 from musicsync.domain.track import Track
-from musicsync.domain.union import compute_to_sync
+from musicsync.domain.union import (
+    canonicalize_presence,
+    compute_tidal_catalog,
+    compute_to_sync,
+    remap_synced_keys,
+    sort_tracks_chronologically,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +55,7 @@ class SyncOptions:
     full: bool = False
     offline: bool = False
     skip_unavailable_providers: bool = False
+    tidal_reorder: bool = False
 
 
 @dataclass
@@ -105,16 +113,22 @@ class SyncService:
                         raise
 
         presence = self._repo.get_liked_by_platform()
+        merged = self._repo.dedupe_title_only_keys()
+        if merged:
+            logger.info("  Fusionadas %d clave(s) title-only duplicada(s)", merged)
+            presence = self._repo.get_liked_by_platform()
         active_platforms = [
             p
             for p in PLATFORMS
             if not self._should_skip_provider(p, options)
         ]
         presence_filtered = {p: presence.get(p, {}) for p in active_platforms}
+        presence_filtered, key_remap = canonicalize_presence(presence_filtered)
 
-        already_synced = {
-            p: self._repo.get_synced_keys(p) for p in active_platforms
-        }
+        already_synced = remap_synced_keys(
+            {p: self._repo.get_synced_keys(p) for p in active_platforms},
+            key_remap,
+        )
         to_sync = compute_to_sync(presence_filtered, already_synced)
         result.to_sync = to_sync
 
@@ -130,17 +144,37 @@ class SyncService:
 
         for platform in _APPLY_ORDER:
             plan = plans[platform]
-            if plan.skip or platform not in to_sync:
+            if plan.skip:
                 continue
             if platform in result.skipped_providers:
                 continue
+
+            tracks = to_sync.get(platform, [])
+            reorder = False
+            if platform == "tidal" and options.apply_tidal:
+                reorder = options.tidal_reorder
+                if reorder:
+                    tracks = compute_tidal_catalog(presence_filtered)
+                    logger.info(
+                        "Tidal reorder: catálogo completo con %d pista(s)",
+                        len(tracks),
+                    )
+                else:
+                    tracks = sort_tracks_chronologically(tracks)
+
+            if not tracks:
+                if plan.apply_flag:
+                    logger.info("%s ya está al día (0 nuevas).", platform.capitalize())
+                continue
+
             self._apply_platform(
                 platform,
-                to_sync[platform],
+                tracks,
                 plan.apply_flag,
                 result,
                 now,
                 review_path=plan.review_path,
+                reorder=reorder,
             )
 
         return result
@@ -187,9 +221,9 @@ class SyncService:
     ) -> None:
         """Log a read failure and mark the provider as skipped for this run."""
         logger.error(
-            "%s: omitiendo dirección (%s). Las demás continúan.",
+            "%s: omitiendo dirección: %s",
             provider.name.capitalize(),
-            exc.__class__.__name__,
+            exc,
         )
         result.skipped_providers.append(provider.name)
 
@@ -202,6 +236,7 @@ class SyncService:
         now: str,
         *,
         review_path: Path | None = None,
+        reorder: bool = False,
     ) -> None:
         """Shared skeleton: guard empty → look up provider → apply or review."""
         if not tracks:
@@ -213,18 +248,34 @@ class SyncService:
             return
 
         if apply_flag:
+            applied_count = 0
+
+            def on_batch(batch: list[Track]) -> None:
+                nonlocal applied_count
+                if not batch:
+                    return
+                self._repo.mark_synced(platform, [t.key for t in batch], when=now)
+                applied_count += len(batch)
+
             try:
-                applied = provider.apply_likes(tracks)
+                applied = provider.apply_likes(
+                    tracks, on_batch=on_batch, reorder=reorder
+                )
                 result.applied[platform] = len(applied)
-                self._repo.mark_synced(platform, [t.key for t in applied], when=now)
+            except PlatformOperationError:
+                if applied_count:
+                    result.applied[platform] = applied_count
+                raise
             except Exception as exc:
                 if provider.graceful_on_error:
                     logger.error(
-                        "%s: fallo al aplicar likes (%s). Dirección omitida.",
+                        "%s: fallo al aplicar likes: %s",
                         provider.name.capitalize(),
-                        exc.__class__.__name__,
+                        exc,
                     )
                     result.skipped_providers.append(provider.name)
+                    if applied_count:
+                        result.applied[platform] = applied_count
                 else:
                     raise
         else:

@@ -176,17 +176,22 @@ export function renderActions(container: HTMLElement): void {
       const label = PLATFORM_LABELS[platform] ?? platform;
 
       const confirmed = confirm(
-        `Apply sync changes to ${label}?\n\nThis will write changes to your ${label} account. This action cannot be undone.`
+        platform === "tidal"
+          ? `Apply sync to ${label}?\n\nThis will REMOVE then re-add ALL tracks that should be on Tidal, in chronological order (oldest liked first → newest at top in the app). This can take a long time and cannot be undone quickly.`
+          : `Apply sync changes to ${label}?\n\nThis will write changes to your ${label} account. This action cannot be undone.`
       );
       if (!confirmed) return;
 
       btn.disabled = true;
       btn.textContent = `Applying to ${label}…`;
       applyLog.style.display = "block";
-      applyLog.textContent += `[${platform}] applying…\n`;
+      applyLog.textContent += `[${platform}] applying${platform === "tidal" ? " (reorder)" : ""}…\n`;
 
       try {
-        const result = await applyPlatform(platform);
+        const result = await applyPlatform(
+          platform,
+          platform === "tidal" ? { reorder: true } : {},
+        );
         applyLog.textContent += `[${platform}] done — ${result.applied} track(s) applied.\n`;
         showToast(`${label}: ${result.applied} tracks applied.`, "success");
       } catch (err) {

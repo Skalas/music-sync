@@ -25,10 +25,17 @@ from sse_starlette.sse import EventSourceResponse
 from musicsync.application.csv_export import write_csv
 from musicsync.application.output_paths import UNMATCHED_LOG_PATH
 from musicsync.application.sync_service import SyncOptions
+from musicsync.domain.errors import PlatformOperationError
 from musicsync.domain.platforms import PLATFORMS
 from musicsync.domain.ports import LibraryProvider
 from musicsync.infrastructure.providers import build_connect_provider
-from musicsync.web.container import BASE_DIR, Container, build_container, connection_status
+from musicsync.web.container import (
+    BASE_DIR,
+    Container,
+    build_container,
+    build_sync_service_for_apply,
+    connection_status,
+)
 from musicsync.web.links import track_url
 
 logger = logging.getLogger(__name__)
@@ -97,6 +104,12 @@ class SyncDiff(BaseModel):
 class ApplyResult(BaseModel):
     platform: str
     applied: int
+
+
+class ApplyRequest(BaseModel):
+    """Body for POST /api/apply/{platform}."""
+
+    reorder: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +226,7 @@ def get_library(
     page: int = 1,
     page_size: int = 50,
 ) -> LibraryPage:
+    container.repo.dedupe_title_only_keys()
     rows = container.repo.iter_enriched_rows(
         sort_by=sort_by if sort_by else None
     )
@@ -298,7 +312,9 @@ def post_sync(container: Container, body: SyncRequest) -> SyncDiff:
     return _diff_to_response(result)
 
 
-def apply_platform(container: Container, platform: str) -> ApplyResult:
+def apply_platform(
+    container: Container, platform: str, *, reorder: bool = False
+) -> ApplyResult:
     if platform not in PLATFORMS:
         raise HTTPException(status_code=404, detail=f"Unknown platform: {platform}")
 
@@ -309,11 +325,19 @@ def apply_platform(container: Container, platform: str) -> ApplyResult:
         apply_spotify=(platform == "spotify"),
         apply_apple=(platform == "apple"),
         apply_tidal=(platform == "tidal"),
+        no_spotify=(platform != "spotify"),
+        no_apple=(platform != "apple"),
+        no_tidal=(platform != "tidal"),
         dry_run=False,
         offline=True,
+        tidal_reorder=reorder and platform == "tidal",
     )
-    with container.sync_lock:
-        result = container.sync_service.run(options)
+    try:
+        with container.sync_lock:
+            service = build_sync_service_for_apply(container, platform)
+            result = service.run(options)
+    except PlatformOperationError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     applied = result.applied.get(platform, 0)
     return ApplyResult(platform=platform, applied=applied)
 
@@ -434,8 +458,11 @@ def create_app(
         response_model=ApplyResult,
         dependencies=[Depends(require_xhr_header)],
     )
-    def _apply(platform: str) -> ApplyResult:
-        return apply_platform(container, platform)
+    def _apply(
+        platform: str,
+        body: Annotated[ApplyRequest, Body()] = ApplyRequest(),
+    ) -> ApplyResult:
+        return apply_platform(container, platform, reorder=body.reorder)
 
     @app.get("/api/export.csv")
     def _export_csv() -> StreamingResponse:
