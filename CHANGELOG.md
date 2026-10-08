@@ -3,6 +3,21 @@
 All notable changes to this project are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] — Sprint 5: real Apple Music track links
+
+### Added
+- **Apple Music song links:** the web app links Apple tracks to the exact song
+  (`music.apple.com/{storefront}/song/{id}`) instead of a search page. See
+  `docs/handoff/post-sprint-5.md`.
+- **Apple Music API client** with an ES256 developer token from `.env` (`APPLE_TEAM_ID`,
+  `APPLE_KEY_ID`, `APPLE_PRIVATE_KEY_PATH`, `APPLE_STOREFRONT`). New deps: `pyjwt`, `cryptography`.
+- **ISRC capture** from Spotify and Tidal into `tracks.isrc`; new `apple_catalog` table.
+- **`--resolve-apple-links [--limit N]`**; also runs after a normal sync (capped at 200 tracks,
+  skipped under `--offline`/`--dry-run`, never fails the sync).
+
+### Fixed
+- mypy errors in test fakes (`tests/test_tidal_provider.py`, `tests/test_sync_service.py`).
+
 ## [Unreleased] — Sprint 2: local web app ("buttons")
 
 A local web app over the existing `musicsync` core: FastAPI backend (`musicsync/web/`) + a
