@@ -38,3 +38,5 @@ web/dist/
 .cursor/agents/metate-*.md
 # metate DoD ledger (per-sprint; start overwrites)
 .metate/dod.json
+# metate state + config are local; stale state reads as current
+.metate/
