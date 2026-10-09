@@ -6,6 +6,10 @@ conectada debe quedar marcada en todas. La conciliación es incremental (SQLite)
 y local (sin servidores externos).
 
 Las escrituras remotas son opt-in por plataforma (--apply-spotify, --apply-apple, --apply-tidal).
+
+Playlists: --list-playlists lista las playlists propias de cada plataforma;
+--mirror-playlist "Nombre" (repetible) refleja esa playlist entre Spotify y Apple
+Music (solo agrega, nunca borra; escribe solo con --apply-spotify / --apply-apple).
 """
 
 from __future__ import annotations
@@ -22,15 +26,21 @@ from musicsync.application.output_paths import (
     APPLESCRIPT_DIR,
     BASE_DIR,
     DEFAULT_DB,
+    PLAYLIST_REVIEW_PATH,
     STATE_PATH,
     TO_APPLE_PATH,
     UNMATCHED_LOG_PATH,
 )
+from musicsync.application.playlist_sync_service import (
+    PlaylistListing,
+    PlaylistSyncOptions,
+    PlaylistSyncService,
+)
 from musicsync.application.sync_service import SyncOptions, SyncService
 from musicsync.domain.errors import PlatformOperationError
-from musicsync.domain.ports import LibraryProvider
+from musicsync.domain.ports import LibraryProvider, PlaylistProvider
 from musicsync.infrastructure.apple_music_api import build_apple_catalog_client
-from musicsync.infrastructure.providers import build_providers
+from musicsync.infrastructure.providers import build_playlist_providers, build_providers
 from musicsync.infrastructure.sqlite_repository import DatabaseError, SqliteTrackRepository
 
 # Tope por defecto del paso post-sync: la primera corrida sobre una biblioteca grande
@@ -83,6 +93,85 @@ def _resolve_apple_links(
     )
     if report.error and required:
         sys.exit(f"Apple Music: resolución detenida: {report.error}")
+
+
+def _playlist_providers(args: argparse.Namespace) -> list[PlaylistProvider]:
+    return build_playlist_providers(
+        BASE_DIR,
+        applescript_dir=APPLESCRIPT_DIR,
+        output_path=TO_APPLE_PATH,
+        unmatched_log_path=UNMATCHED_LOG_PATH,
+        write_spotify=args.apply_spotify,
+        include_spotify=not args.no_spotify,
+        include_apple=not args.no_apple,
+        include_tidal=not args.no_tidal,
+    )
+
+
+def _tsv_cell(value: str) -> str:
+    return " ".join(value.split())
+
+
+def print_playlist_listing(listing: PlaylistListing) -> None:
+    """One line per playlist on stdout: ``platform<TAB>name<TAB>track_count``."""
+    for platform, summaries in listing.playlists.items():
+        for summary in summaries:
+            print(f"{platform}\t{_tsv_cell(summary.name)}\t{summary.track_count}")
+
+
+def run_list_playlists(repo: SqliteTrackRepository, args: argparse.Namespace) -> None:
+    listing = PlaylistSyncService(repo, _playlist_providers(args)).list_playlists()
+    print_playlist_listing(listing)
+    if listing.skipped and not listing.playlists:
+        sys.exit("No se pudo listar playlists en ninguna plataforma.")
+
+
+def run_playlist_mirror(repo: SqliteTrackRepository, args: argparse.Namespace) -> None:
+    apply_platforms = frozenset(
+        platform
+        for platform, enabled in (
+            ("spotify", args.apply_spotify),
+            ("apple", args.apply_apple),
+        )
+        if enabled
+    )
+    options = PlaylistSyncOptions(
+        names=tuple(args.mirror_playlist),
+        apply_platforms=apply_platforms,
+        dry_run=args.dry_run,
+    )
+    service = PlaylistSyncService(
+        repo, _playlist_providers(args), review_path=PLAYLIST_REVIEW_PATH
+    )
+    print("Leyendo playlists...")
+    service.run(options)
+
+
+def _reject_playlist_conflicts(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Playlist modes run alone: liked-songs-only flags would be silently ignored."""
+    if not (args.list_playlists or args.mirror_playlist):
+        return
+    listing = args.list_playlists
+    conflicting = [
+        flag
+        for flag, enabled in (
+            ("--mirror-playlist", listing and bool(args.mirror_playlist)),
+            ("--offline", args.offline),
+            ("--export", args.export is not None),
+            ("--resolve-apple-links", args.resolve_apple_links),
+            ("--full", args.full),
+            # Tidal playlists are read-only this sprint.
+            ("--apply-tidal", args.apply_tidal),
+            ("--tidal-reorder", args.tidal_reorder),
+            ("--apply-spotify", listing and args.apply_spotify),
+            ("--apply-apple", listing and args.apply_apple),
+            ("--dry-run", listing and args.dry_run),
+        )
+        if enabled
+    ]
+    if conflicting:
+        mode = "--list-playlists" if listing else "--mirror-playlist"
+        p.error(f"{mode} es incompatible con {', '.join(conflicting)}.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -152,7 +241,23 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help="máximo de pistas a resolver en el catálogo de Apple Music por corrida",
     )
+    p.add_argument(
+        "--list-playlists",
+        action="store_true",
+        help="lista las playlists propias (plataforma<TAB>nombre<TAB>canciones) y termina",
+    )
+    p.add_argument(
+        "--mirror-playlist",
+        action="append",
+        default=[],
+        metavar="NOMBRE",
+        help=(
+            "refleja la playlist NOMBRE entre plataformas (repetible); solo agrega. "
+            "Escribe solo con --apply-spotify / --apply-apple"
+        ),
+    )
     args = p.parse_args()
+    _reject_playlist_conflicts(p, args)
 
     if args.offline and args.resolve_apple_links:
         p.error("--offline es incompatible con --resolve-apple-links: requiere red.")
@@ -218,6 +323,16 @@ def main() -> None:
     if args.resolve_apple_links:
         try:
             run_apple_link_resolution(repo, limit=args.limit, required=True)
+        finally:
+            repo.close()
+        return
+
+    if args.list_playlists or args.mirror_playlist:
+        try:
+            if args.list_playlists:
+                run_list_playlists(repo, args)
+            else:
+                run_playlist_mirror(repo, args)
         finally:
             repo.close()
         return

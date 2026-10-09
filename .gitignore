@@ -11,6 +11,7 @@ library.db
 canciones_to_apple.txt
 to_spotify_review.txt
 unmatched.log
+playlists_review.txt
 *_export.csv
 export.csv
 
