@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import time
 from collections.abc import Callable
+from enum import IntEnum
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -16,6 +18,7 @@ from spotipy.oauth2 import SpotifyOAuth
 from tqdm import tqdm
 
 from musicsync.domain.errors import PlatformOperationError
+from musicsync.domain.playlist import Playlist, PlaylistAddResult, PlaylistSummary
 from musicsync.domain.track import Track, date_only, year_from_date
 from musicsync.infrastructure._env import load_env_keys
 
@@ -23,6 +26,12 @@ logger = logging.getLogger(__name__)
 
 SCOPE_READ = "user-library-read"
 SCOPE_WRITE = "user-library-modify"
+SCOPE_PLAYLIST_READ = "playlist-read-private"
+# GET /me/playlists omits collaborative playlists without this scope.
+SCOPE_PLAYLIST_READ_COLLABORATIVE = "playlist-read-collaborative"
+SCOPE_PLAYLIST_WRITE = "playlist-modify-private playlist-modify-public"
+TOKEN_CACHE_NAME = ".cache"
+SPOTIFY_PLAYLIST_ADD_BATCH = 100
 SPOTIFY_PAGE_LIMIT = 50
 # PUT /me/library accepts at most 40 URIs (Feb 2026 library API; was 50 on /me/tracks).
 SPOTIFY_ADD_BATCH = 40
@@ -30,12 +39,65 @@ MAX_RETRIES = 5
 # Per-track search: stay under dev-mode rate limits and outwait 429 windows.
 SPOTIFY_SEARCH_DELAY_SEC = 0.2
 SPOTIFY_SEARCH_MAX_ATTEMPTS = 20
+AUTH_REQUIRED_MESSAGE = (
+    "Spotify: falta autorización (token ausente, expirado o sin el permiso pedido); "
+    "reconecta Spotify en Conexiones o corre la CLI una vez."
+)
+
+
+class PlaylistScope(IntEnum):
+    """Playlist OAuth scope requested on top of the liked-songs scopes."""
+
+    NONE = 0
+    READ = 1
+    WRITE = 2
+
+
+def playlist_scopes(scope: PlaylistScope) -> list[str]:
+    if scope is PlaylistScope.NONE:
+        return []
+    read = [SCOPE_PLAYLIST_READ, SCOPE_PLAYLIST_READ_COLLABORATIVE]
+    if scope is PlaylistScope.READ:
+        return read
+    return [*read, *SCOPE_PLAYLIST_WRITE.split()]
+
+
+def cached_token_scopes(base_dir: Path) -> set[str]:
+    """Scopes granted to the cached Spotify token (empty when absent/unreadable)."""
+    try:
+        cached = json.loads((base_dir / TOKEN_CACHE_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    scope = cached.get("scope") if isinstance(cached, dict) else None
+    return set(str(scope).split()) if scope else set()
+
+
+def requested_scopes(needed: list[str], granted: set[str]) -> str:
+    """*needed* plus every scope already granted, so a run never narrows the grant.
+
+    spotipy rewrites the cached token's scope with the requested one on refresh
+    and re-prompts when requested is not a subset of cached; requesting the union
+    keeps liked-songs and playlist runs from invalidating each other's token.
+    Only scopes the user already granted are added — never a new write scope.
+    """
+    extra = sorted(granted - set(needed))
+    return " ".join([*needed, *extra])
+
+
+class _NonInteractiveSpotifyOAuth(SpotifyOAuth):
+    """Never prompts or opens a browser: an unusable token raises instead (web)."""
+
+    def get_auth_response(self, open_browser: bool | None = None) -> str:
+        raise PlatformOperationError(AUTH_REQUIRED_MESSAGE)
 
 
 class SpotifyProvider:
     name = "spotify"
     can_write = True
     graceful_on_error = False
+    can_playlist_read = True
+    can_playlist_write = True
+    reserved_playlist_names: frozenset[str] = frozenset()
 
     def __init__(
         self,
@@ -43,10 +105,14 @@ class SpotifyProvider:
         base_dir: Path,
         unmatched_log_path: Path,
         need_write: bool = False,
+        playlist_scope: PlaylistScope = PlaylistScope.NONE,
+        interactive: bool = True,
         client: spotipy.Spotify | None = None,
     ) -> None:
         self._base_dir = base_dir
         self._need_write = need_write
+        self._playlist_scope = playlist_scope
+        self._interactive = interactive
         self._client = client
         self._unmatched_log_path = unmatched_log_path
 
@@ -54,14 +120,15 @@ class SpotifyProvider:
         if self._client is not None:
             return self._client
         config = self._load_config(self._need_write)
-        cache_path = self._base_dir / ".cache"
-        auth = SpotifyOAuth(
+        cache_path = self._base_dir / TOKEN_CACHE_NAME
+        oauth_class = SpotifyOAuth if self._interactive else _NonInteractiveSpotifyOAuth
+        auth = oauth_class(
             client_id=config["SPOTIPY_CLIENT_ID"],
             client_secret=config["SPOTIPY_CLIENT_SECRET"],
             redirect_uri=config["SPOTIPY_REDIRECT_URI"],
             scope=config["scope"],
             cache_path=str(cache_path),
-            open_browser=True,
+            open_browser=self._interactive,
         )
         self._client = spotipy.Spotify(auth_manager=auth, retries=0)
         return self._client
@@ -80,7 +147,11 @@ class SpotifyProvider:
                 "ERROR: el Redirect URI usa 'localhost', que Spotify ya no acepta.\n"
                 "Usa la IP de loopback: http://127.0.0.1:8080"
             )
-        config["scope"] = f"{SCOPE_READ} {SCOPE_WRITE}" if need_write else SCOPE_READ
+        scopes = [SCOPE_READ, *([SCOPE_WRITE] if need_write else [])]
+        config["scope"] = requested_scopes(
+            scopes + playlist_scopes(self._playlist_scope),
+            cached_token_scopes(self._base_dir),
+        )
         return config
 
     def read_liked(self) -> list[Track]:
@@ -182,6 +253,99 @@ class SpotifyProvider:
                 on_batch(matched_tracks)
 
         return applied
+
+    # -- playlists -----------------------------------------------------------
+
+    def list_playlists(self) -> list[PlaylistSummary]:
+        """Every playlist in the library; ``owned=False`` marks followed/others' ones.
+
+        The user's own playlists count whether or not they are collaborative.
+        Non-owned ones are returned only so a same-named followed playlist is
+        reported as ambiguous instead of a duplicate being created.
+        """
+        sp = self._get_client()
+        user_id = str(_with_retries(sp.current_user).get("id") or "")
+        return [
+            PlaylistSummary(
+                platform=self.name,
+                name=str(item.get("name") or ""),
+                remote_id=str(item["id"]),
+                track_count=_playlist_total(item),
+                owned=_is_own_playlist(item, user_id),
+            )
+            for item in _paged(sp.current_user_playlists)
+            if item.get("id")
+        ]
+
+    def read_playlist(self, summary: PlaylistSummary) -> Playlist:
+        sp = self._get_client()
+        tracks: list[Track] = []
+        for entry in _paged(
+            sp.playlist_items, summary.remote_id, additional_types=("track",)
+        ):
+            track = _playlist_entry_track(entry)
+            if track is not None:
+                tracks.append(track)
+        return Playlist(
+            platform=self.name,
+            name=summary.name,
+            remote_id=summary.remote_id,
+            tracks=tuple(tracks),
+        )
+
+    def add_to_playlist(
+        self, name: str, remote_id: str | None, tracks: list[Track]
+    ) -> PlaylistAddResult:
+        """Resolve each track by Spotify search (never a foreign id) and append it."""
+        if self._playlist_scope is not PlaylistScope.WRITE:
+            raise PlatformOperationError(
+                "Spotify: escribir playlists requiere --apply-spotify "
+                "(scope playlist-modify)."
+            )
+        sp = self._get_client()
+        existing = self._playlist_track_ids(sp, remote_id)
+        to_post: list[str] = []
+        added: list[Track] = []
+        unresolved: list[Track] = []
+        for track in tqdm(tracks, desc=f"Match en Spotify ({name})", unit="cancion"):
+            # No artist → "track:X artist:" can match a different song: never search.
+            spotify_id = self._search_track_id(sp, track) if track.artist.strip() else None
+            if spotify_id is None:
+                unresolved.append(track)
+                continue
+            if spotify_id not in existing:
+                existing.add(spotify_id)
+                to_post.append(spotify_id)
+            added.append(track)
+        if to_post:
+            remote_id = remote_id or self._create_playlist(sp, name)
+            self._post_playlist_items(sp, remote_id, to_post)
+        return PlaylistAddResult(remote_id=remote_id, added=added, unresolved=unresolved)
+
+    def _playlist_track_ids(self, sp: spotipy.Spotify, remote_id: str | None) -> set[str]:
+        if remote_id is None:
+            return set()
+        ids: set[str] = set()
+        for entry in _paged(sp.playlist_items, remote_id, additional_types=("track",)):
+            track = _playlist_entry_track(entry)
+            if track is not None and track.platform_id:
+                ids.add(track.platform_id)
+        return ids
+
+    @staticmethod
+    def _create_playlist(sp: spotipy.Spotify, name: str) -> str:
+        created = _with_playlist_errors(
+            sp.current_user_playlist_create, name, public=False
+        )
+        return str(created["id"])
+
+    @staticmethod
+    def _post_playlist_items(
+        sp: spotipy.Spotify, remote_id: str, track_ids: list[str]
+    ) -> None:
+        for start in range(0, len(track_ids), SPOTIFY_PLAYLIST_ADD_BATCH):
+            batch = track_ids[start : start + SPOTIFY_PLAYLIST_ADD_BATCH]
+            _with_playlist_errors(sp.playlist_add_items, remote_id, batch)
 
     def write_review(self, tracks: list[Track], path: Path) -> None:
         sp = self._get_client()
@@ -286,6 +450,54 @@ def _retry_after_seconds(exc: SpotifyException, attempt: int) -> float:
     if exc.headers and exc.headers.get("Retry-After") is not None:
         return float(exc.headers["Retry-After"])
     return float(min(2**attempt, 60))
+
+
+def _paged(fn: Callable[..., dict[str, Any]], *args: Any, **kwargs: Any) -> list[dict]:
+    """Every item of an offset-paged Spotify listing."""
+    items: list[dict] = []
+    offset = 0
+    while True:
+        page = _with_retries(fn, *args, limit=SPOTIFY_PAGE_LIMIT, offset=offset, **kwargs)
+        batch = page.get("items") or []
+        items.extend(item for item in batch if item)
+        if not page.get("next") or not batch:
+            return items
+        offset += SPOTIFY_PAGE_LIMIT
+
+
+def _is_own_playlist(item: dict[str, Any], user_id: str) -> bool:
+    owner = (item.get("owner") or {}).get("id")
+    return bool(user_id) and owner == user_id
+
+
+def _playlist_total(item: dict[str, Any]) -> int:
+    # Feb 2026 Web API renamed the playlist's "tracks" object to "items".
+    ref = item.get("items") or item.get("tracks") or {}
+    return int(ref.get("total") or 0) if isinstance(ref, dict) else 0
+
+
+def _playlist_entry_track(entry: dict[str, Any]) -> Track | None:
+    # Feb 2026 Web API renamed the entry's "track" field to "item".
+    data = entry.get("item") or entry.get("track")
+    if not data or data.get("type", "track") != "track" or not data.get("name"):
+        return None
+    return Track(
+        name=data["name"],
+        artist=", ".join(a["name"] for a in data.get("artists", []) if a.get("name")),
+        platform_id=data.get("id") or None,
+    )
+
+
+def _with_playlist_errors(fn: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
+    try:
+        return _with_retries(fn, *args, **kwargs)
+    except SpotifyException as exc:
+        if exc.http_status == 403:
+            raise PlatformOperationError(
+                "Spotify rechazó escribir la playlist (HTTP 403 — scope insuficiente). "
+                "Vuelve a autorizar con --apply-spotify y acepta playlist-modify."
+            ) from exc
+        raise
 
 
 def _add_track_ids(sp: spotipy.Spotify, track_ids: list[str]) -> None:

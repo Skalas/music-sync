@@ -6,6 +6,7 @@ or remote libraries are touched.  Providers are monkeypatched where needed.
 
 from __future__ import annotations
 
+import json
 import threading
 from pathlib import Path
 from typing import Any
@@ -820,3 +821,220 @@ class TestCsvExport:
     def test_seeded_tracks_appear_in_csv(self, client: TestClient) -> None:
         resp = client.get("/api/export.csv")
         assert "Bohemian Rhapsody" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# P8 — read-only playlists API
+# ---------------------------------------------------------------------------
+
+
+def _playlist_client(seeded_db: Path, *providers: Any) -> TestClient:
+    return TestClient(
+        create_app(db_path=seeded_db, providers=[], playlist_providers=list(providers))
+    )
+
+
+def _playlist_fakes() -> tuple[Any, Any]:
+    from tests.playlist_fakes import FakePlaylistProvider, track
+
+    spotify = FakePlaylistProvider("spotify", {"Road Trip": [track("Song A")]})
+    apple = FakePlaylistProvider(
+        "apple", {"road trip": [track("Song B")], "Gym": [track("Song C")]}
+    )
+    return spotify, apple
+
+
+class TestPlaylistsEndpoint:
+    def test_get_playlists_lists_connected_platforms(self, seeded_db: Path) -> None:
+        client = _playlist_client(seeded_db, *_playlist_fakes())
+
+        resp = client.get("/api/playlists", headers=XHR_HEADERS)
+
+        assert resp.status_code == 200
+        platforms = {p["platform"]: p for p in resp.json()["platforms"]}
+        assert set(platforms) == {"spotify", "apple"}
+        assert platforms["apple"]["playlists"] == [
+            {"name": "road trip", "track_count": 1},
+            {"name": "Gym", "track_count": 1},
+        ]
+        assert platforms["spotify"]["error"] is None
+
+    def test_get_playlists_reports_failed_platform_without_failing(
+        self, seeded_db: Path
+    ) -> None:
+        spotify, apple = _playlist_fakes()
+        spotify.read_error = RuntimeError("token expired\ntraceback noise")
+
+        client = _playlist_client(seeded_db, spotify, apple)
+        resp = client.get("/api/playlists", headers=XHR_HEADERS)
+
+        assert resp.status_code == 200
+        platforms = {p["platform"]: p for p in resp.json()["platforms"]}
+        assert platforms["spotify"] == {
+            "platform": "spotify",
+            "playlists": [],
+            "error": "token expired",
+        }
+        assert len(platforms["apple"]["playlists"]) == 2
+
+    def test_get_playlists_with_no_providers_is_empty(self, client: TestClient) -> None:
+        resp = client.get("/api/playlists", headers=XHR_HEADERS)
+        assert resp.status_code == 200
+        assert resp.json() == {"platforms": []}
+
+    def test_get_playlists_requires_xhr_header(self, seeded_db: Path) -> None:
+        spotify, apple = _playlist_fakes()
+        client = _playlist_client(seeded_db, spotify, apple)
+
+        resp = client.get("/api/playlists")
+
+        assert resp.status_code == 403
+
+    def test_playlist_preview_reports_ambiguous_names(self, seeded_db: Path) -> None:
+        from tests.playlist_fakes import FakePlaylistProvider, track
+
+        spotify = FakePlaylistProvider("spotify", {"Gym": [track("A")], "gym ": [track("B")]})
+        apple = FakePlaylistProvider("apple", {"Gym": [track("C")]})
+        client = _playlist_client(seeded_db, spotify, apple)
+
+        resp = client.post(
+            "/api/playlists/preview", json={"names": ["Gym"]}, headers=XHR_HEADERS
+        )
+
+        body = resp.json()
+        assert body["ambiguous"] == {"gym": ["spotify"]}
+        assert body["playlists"][0]["counts"] == {"apple": 0}
+
+    def test_playlist_preview_requires_xhr_header(self, seeded_db: Path) -> None:
+        client = _playlist_client(seeded_db, *_playlist_fakes())
+
+        resp = client.post("/api/playlists/preview", json={"names": ["Road Trip"]})
+
+        assert resp.status_code == 403
+
+    def test_playlist_preview_returns_diff_without_remote_writes(
+        self, seeded_db: Path
+    ) -> None:
+        spotify, apple = _playlist_fakes()
+        client = _playlist_client(seeded_db, spotify, apple)
+
+        resp = client.post(
+            "/api/playlists/preview",
+            json={"names": ["Road Trip", "Missing One"]},
+            headers=XHR_HEADERS,
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["missing"] == ["missing one"]
+        assert body["skipped"] == {}
+        (item,) = body["playlists"]
+        assert item["name"] == "Road Trip"
+        assert item["counts"] == {"spotify": 1, "apple": 1}
+        assert item["to_add"]["apple"][0]["name"] == "Song A"
+        assert spotify.add_calls == [] and apple.add_calls == []
+
+    def test_playlist_preview_rejects_empty_names(self, seeded_db: Path) -> None:
+        client = _playlist_client(seeded_db, *_playlist_fakes())
+
+        resp = client.post(
+            "/api/playlists/preview", json={"names": []}, headers=XHR_HEADERS
+        )
+
+        assert resp.status_code == 422
+
+    def test_playlist_gating_skips_spotify_without_playlist_scope(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import musicsync.web.container as container_mod
+
+        monkeypatch.setenv("SPOTIPY_CLIENT_ID", "id")
+        monkeypatch.setenv("SPOTIPY_CLIENT_SECRET", "secret")
+        monkeypatch.setenv("SPOTIPY_REDIRECT_URI", "http://127.0.0.1:8080")
+        base = tmp_path / "liked_only_token"
+        base.mkdir()
+        (base / ".cache").write_text(
+            json.dumps({"scope": "user-library-read"}), encoding="utf-8"
+        )
+        monkeypatch.setattr(container_mod, "BASE_DIR", base)
+
+        providers, gating = container_mod._build_playlist_providers()
+
+        assert "spotify" not in {p.name for p in providers}
+        assert "--list-playlists" in gating["spotify"]
+
+    def test_playlist_gating_skips_spotify_without_collaborative_scope(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import musicsync.web.container as container_mod
+
+        monkeypatch.setenv("SPOTIPY_CLIENT_ID", "id")
+        monkeypatch.setenv("SPOTIPY_CLIENT_SECRET", "secret")
+        monkeypatch.setenv("SPOTIPY_REDIRECT_URI", "http://127.0.0.1:8080")
+        base = tmp_path / "pre_collab_token"
+        base.mkdir()
+        (base / ".cache").write_text(
+            json.dumps({"scope": "user-library-read playlist-read-private"}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(container_mod, "BASE_DIR", base)
+
+        providers, gating = container_mod._build_playlist_providers()
+
+        assert "spotify" not in {p.name for p in providers}
+        assert "--list-playlists" in gating["spotify"]
+
+    def test_playlist_gating_includes_spotify_with_playlist_scope(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import musicsync.web.container as container_mod
+
+        monkeypatch.setenv("SPOTIPY_CLIENT_ID", "id")
+        monkeypatch.setenv("SPOTIPY_CLIENT_SECRET", "secret")
+        monkeypatch.setenv("SPOTIPY_REDIRECT_URI", "http://127.0.0.1:8080")
+        base = tmp_path / "playlist_token"
+        base.mkdir()
+        (base / ".cache").write_text(
+            json.dumps(
+                {
+                    "scope": "user-library-read playlist-read-private "
+                    "playlist-read-collaborative"
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(container_mod, "BASE_DIR", base)
+
+        providers, gating = container_mod._build_playlist_providers()
+
+        assert "spotify" in {p.name for p in providers}
+        assert "spotify" not in gating
+        read_path: list[Any] = [*providers, *container_mod._build_providers()]
+        oauth = [p for p in read_path if p.name in ("spotify", "tidal")]
+        assert oauth and all(p._interactive is False for p in oauth)  # noqa: SLF001
+
+        liked = container_mod._build_providers()
+        apply_path: list[Any] = container_mod._upgrade_write_scope(liked, "spotify")
+        (spotify_apply,) = [p for p in apply_path if p.name == "spotify"]
+        assert spotify_apply._interactive is True  # noqa: SLF001
+        assert spotify_apply._need_write is True  # noqa: SLF001
+
+    def test_apply_fallback_providers_are_interactive(
+        self, seeded_db: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import musicsync.web.container as container_mod
+
+        monkeypatch.setenv("SPOTIPY_CLIENT_ID", "id")
+        monkeypatch.setenv("SPOTIPY_CLIENT_SECRET", "secret")
+        monkeypatch.setenv("SPOTIPY_REDIRECT_URI", "http://127.0.0.1:8080")
+        base = tmp_path / "apply_fallback"
+        base.mkdir()
+        (base / ".cache").write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(container_mod, "BASE_DIR", base)
+        empty = build_container(seeded_db, providers=[])
+
+        service = container_mod.build_sync_service_for_apply(empty, "spotify")
+
+        spotify: Any = service._providers["spotify"]  # noqa: SLF001
+        assert spotify._interactive is True  # noqa: SLF001
+        assert spotify._need_write is True  # noqa: SLF001

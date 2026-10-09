@@ -76,6 +76,36 @@ export interface ApplyRequest {
   reorder?: boolean;
 }
 
+export interface PlaylistInfo {
+  name: string;
+  track_count: number;
+}
+
+export interface PlatformPlaylists {
+  platform: string;
+  playlists: PlaylistInfo[];
+  /** One-line reason when the platform's playlists could not be listed. */
+  error: string | null;
+}
+
+export interface PlaylistsResponse {
+  platforms: PlatformPlaylists[];
+}
+
+export interface PlaylistPreviewItem {
+  name: string;
+  to_add: Record<string, SyncTrack[]>;
+  counts: Record<string, number>;
+}
+
+export interface PlaylistPreview {
+  playlists: PlaylistPreviewItem[];
+  skipped: Record<string, string>;
+  missing: string[];
+  /** Playlist name → platforms holding several playlists with that name (skipped). */
+  ambiguous: Record<string, string[]>;
+}
+
 // ---------------------------------------------------------------------------
 // Platform metadata — single source of truth for the three views
 // ---------------------------------------------------------------------------
@@ -168,6 +198,22 @@ export function applyPlatform(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+  });
+}
+
+/** Live platform reads: the server guards this GET with the XHR header too. */
+export function getPlaylists(): Promise<PlaylistsResponse> {
+  return apiFetch<PlaylistsResponse>("/api/playlists", {
+    headers: { "X-Requested-With": "XMLHttpRequest" },
+  });
+}
+
+/** Dry-run mirror diff for the named playlists — never writes to any platform. */
+export function previewPlaylists(names: string[]): Promise<PlaylistPreview> {
+  return apiFetch<PlaylistPreview>("/api/playlists/preview", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ names }),
   });
 }
 

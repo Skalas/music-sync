@@ -23,6 +23,8 @@ import requests
 from requests.exceptions import RequestException
 from tqdm import tqdm
 
+from musicsync.domain.errors import PlatformOperationError
+from musicsync.domain.playlist import Playlist, PlaylistAddResult, PlaylistSummary
 from musicsync.domain.track import Track, date_only, year_from_date
 from musicsync.domain.union import sort_tracks_chronologically
 from musicsync.infrastructure._env import load_env_keys
@@ -36,6 +38,16 @@ SCOPE_READ = "collection.read"
 SCOPE_WRITE = "collection.write"
 ADD_BATCH = 20
 MAX_RETRIES = 3
+# Includes are paths relative to the collection's `items` relationship: the API
+# rejects a top-level "artists" include with HTTP 400 ("Invalid include path").
+COLLECTION_INCLUDE = "items.artists,items.albums"
+ERROR_DETAIL_MAX_CHARS = 300
+COUNTRY_CODE = "US"
+AUTH_REQUIRED_MESSAGE = "Tidal: token expirado o ausente; reconecta Tidal en Conexiones."
+PLAYLISTS_PATH = "/playlists"
+OWNED_PLAYLISTS_FILTER = {"filter[owners.id]": "me"}
+PLAYLIST_ITEMS_INCLUDE = "items.artists"
+TRACK_RESOURCE_TYPE = "tracks"
 
 
 @dataclass
@@ -58,16 +70,22 @@ class TidalProvider:
     name = "tidal"
     can_write = True
     graceful_on_error = True
+    # Playlists are read-only: the playlist write scope was never granted.
+    can_playlist_read = True
+    can_playlist_write = False
+    reserved_playlist_names: frozenset[str] = frozenset()
 
     def __init__(
         self,
         *,
         base_dir: Path,
         need_write: bool = False,
+        interactive: bool = True,
         session: requests.Session | None = None,
     ) -> None:
         self._base_dir = base_dir
         self._need_write = need_write
+        self._interactive = interactive
         self._session = session or requests.Session()
         self._cache_path = base_dir / ".tidal-cache"
         self._config = self._load_config()
@@ -94,7 +112,7 @@ class TidalProvider:
 
         while True:
             params: dict[str, str] = {
-                "include": "items,artists",
+                "include": COLLECTION_INCLUDE,
                 "countryCode": "US",
             }
             if cursor:
@@ -123,6 +141,77 @@ class TidalProvider:
 
     def write_review(self, tracks: list[Track], path: Path) -> None:
         """No-op: Tidal does not have a review-file flow."""
+
+    # -- playlists (read-only) -------------------------------------------------
+
+    def _paged_get(
+        self, path: str, ctx: _ApiContext, params: dict[str, str]
+    ) -> list[dict[str, Any]]:
+        """All pages of a cursor-paged JSON:API GET (one dict per page)."""
+        pages: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            page_params = dict(params)
+            if cursor:
+                page_params["page[cursor]"] = cursor
+            data = self._api_get(path, ctx, params=page_params)
+            pages.append(data)
+            cursor = _next_cursor(data.get("links", {}))
+            if not cursor:
+                return pages
+
+    def _read_ctx(self) -> _ApiContext:
+        return _ApiContext(token=self._ensure_token(need_write=False), need_write=False)
+
+    def list_playlists(self) -> list[PlaylistSummary]:
+        params = {"countryCode": COUNTRY_CODE, **OWNED_PLAYLISTS_FILTER}
+        summaries: list[PlaylistSummary] = []
+        for page in self._paged_get(PLAYLISTS_PATH, self._read_ctx(), params):
+            for item in page.get("data", []):
+                attrs = item.get("attributes") or {}
+                if not item.get("id") or not attrs.get("name"):
+                    continue
+                summaries.append(
+                    PlaylistSummary(
+                        platform=self.name,
+                        name=str(attrs["name"]),
+                        remote_id=str(item["id"]),
+                        track_count=int(attrs.get("numberOfItems") or 0),
+                    )
+                )
+        return summaries
+
+    def read_playlist(self, summary: PlaylistSummary) -> Playlist:
+        path = f"{PLAYLISTS_PATH}/{quote(summary.remote_id or '', safe='')}/relationships/items"
+        params = {"countryCode": COUNTRY_CODE, "include": PLAYLIST_ITEMS_INCLUDE}
+        ctx = self._read_ctx()
+        artist_cache: dict[str, str] = {}
+        tracks: list[Track] = []
+        for page in self._paged_get(path, ctx, params):
+            included = _index_included(page.get("included", []))
+            for item in page.get("data", []):
+                if item.get("type") != TRACK_RESOURCE_TYPE:
+                    continue
+                track = _parse_collection_item(item, included)
+                if track is not None:
+                    # Same fallback as read_liked: an artist missing from
+                    # `included` would otherwise yield a title-only match key.
+                    tracks.append(
+                        self._enrich_track_artist(ctx, item, included, track, artist_cache)
+                    )
+        return Playlist(
+            platform=self.name,
+            name=summary.name,
+            remote_id=summary.remote_id,
+            tracks=tuple(tracks),
+        )
+
+    def add_to_playlist(
+        self, name: str, remote_id: str | None, tracks: list[Track]
+    ) -> PlaylistAddResult:
+        raise PlatformOperationError(
+            "Tidal: las playlists son solo lectura (sin scope de escritura)."
+        )
 
     def apply_likes(
         self,
@@ -388,6 +477,9 @@ class TidalProvider:
             except TidalError:
                 pass
 
+        if not self._interactive:
+            # Web process: never open a browser / block on the :8080 callback.
+            raise TidalError(AUTH_REQUIRED_MESSAGE, status_code=401)
         scopes = SCOPE_READ if not need_write else f"{SCOPE_READ} {SCOPE_WRITE}"
         tokens = self._authorize_pkce(scopes)
         self._write_cache(tokens)
@@ -496,7 +588,7 @@ class TidalProvider:
                 if attempt < MAX_RETRIES:
                     continue
             if resp.status_code >= 400:
-                raise _http_error("GET", path, resp.status_code)
+                raise _http_error("GET", path, resp.status_code, _error_detail(resp))
 
             body: dict[str, Any] = resp.json()
             return body
@@ -535,7 +627,7 @@ class TidalProvider:
                 if attempt < MAX_RETRIES:
                     continue
             if resp.status_code >= 400:
-                raise _http_error("POST", path, resp.status_code)
+                raise _http_error("POST", path, resp.status_code, _error_detail(resp))
 
             return
 
@@ -573,7 +665,7 @@ class TidalProvider:
                 if attempt < MAX_RETRIES:
                     continue
             if resp.status_code >= 400:
-                raise _http_error("DELETE", path, resp.status_code)
+                raise _http_error("DELETE", path, resp.status_code, _error_detail(resp))
 
             return
 
@@ -614,12 +706,37 @@ _HTTP_STATUS_HINTS: dict[int, str] = {
 }
 
 
-def _http_error(method: str, path: str, status: int) -> TidalError:
+def _http_error(
+    method: str, path: str, status: int, detail: str = ""
+) -> TidalError:
     hint = _HTTP_STATUS_HINTS.get(status)
     message = f"{method} {path} HTTP {status}"
     if hint:
         message = f"{message} — {hint}"
+    if detail:
+        message = f"{message} ({detail})"
     return TidalError(message, status_code=status)
+
+
+def _error_detail(resp: requests.Response) -> str:
+    """Return the JSON:API ``errors[].detail`` text of a failed response.
+
+    Only the server-authored detail strings are surfaced (never headers or the
+    request), so tokens cannot leak into logs.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return ""
+    errors = body.get("errors") if isinstance(body, dict) else None
+    if not isinstance(errors, list):
+        return ""
+    details = [
+        str(err["detail"])
+        for err in errors
+        if isinstance(err, dict) and err.get("detail")
+    ]
+    return "; ".join(details)[:ERROR_DETAIL_MAX_CHARS]
 
 
 def _pkce_challenge(verifier: str) -> str:

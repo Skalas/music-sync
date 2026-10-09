@@ -19,15 +19,17 @@ from typing import Annotated, Any
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from musicsync.application.csv_export import write_csv
 from musicsync.application.output_paths import UNMATCHED_LOG_PATH
+from musicsync.application.playlist_sync_service import PlaylistSyncOptions
 from musicsync.application.sync_service import SyncOptions
 from musicsync.domain.errors import PlatformOperationError
 from musicsync.domain.platforms import PLATFORMS
-from musicsync.domain.ports import LibraryProvider
+from musicsync.domain.ports import LibraryProvider, PlaylistProvider
+from musicsync.domain.track import Track
 from musicsync.infrastructure.providers import build_connect_provider
 from musicsync.web.container import (
     BASE_DIR,
@@ -112,9 +114,53 @@ class ApplyRequest(BaseModel):
     reorder: bool = False
 
 
+MAX_PREVIEW_PLAYLISTS = 20
+MAX_PLAYLIST_NAME_CHARS = 200
+
+
+class PlaylistInfo(BaseModel):
+    name: str
+    track_count: int
+
+
+class PlatformPlaylists(BaseModel):
+    platform: str
+    playlists: list[PlaylistInfo] = []
+    # One-line reason when the platform's playlists could not be listed.
+    error: str | None = None
+
+
+class PlaylistsResponse(BaseModel):
+    platforms: list[PlatformPlaylists]
+
+
+class PlaylistPreviewRequest(BaseModel):
+    names: list[Annotated[str, Field(min_length=1, max_length=MAX_PLAYLIST_NAME_CHARS)]] = (
+        Field(min_length=1, max_length=MAX_PREVIEW_PLAYLISTS)
+    )
+
+
+class PlaylistPreviewItem(BaseModel):
+    name: str
+    to_add: dict[str, list[dict[str, str]]]
+    counts: dict[str, int]
+
+
+class PlaylistPreview(BaseModel):
+    playlists: list[PlaylistPreviewItem]
+    skipped: dict[str, str]
+    missing: list[str]
+    # {playlist name key: [platforms with several playlists of that name]}
+    ambiguous: dict[str, list[str]] = {}
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _track_rows(tracks: list[Track]) -> list[dict[str, str]]:
+    return [{"key": t.key, "name": t.name, "artist": t.artist} for t in tracks]
 
 
 def _web_sync_options(offline: bool = False) -> SyncOptions:
@@ -212,9 +258,7 @@ def _diff_to_response(result: Any) -> SyncDiff:
     to_sync: dict[str, list[dict[str, str]]] = {}
     counts: dict[str, int] = {}
     for platform, tracks in result.to_sync.items():
-        to_sync[platform] = [
-            {"key": t.key, "name": t.name, "artist": t.artist} for t in tracks
-        ]
+        to_sync[platform] = _track_rows(tracks)
         counts[platform] = len(tracks)
     return SyncDiff(to_sync=to_sync, counts=counts)
 
@@ -349,6 +393,52 @@ def apply_platform(
     return ApplyResult(platform=platform, applied=applied)
 
 
+def get_playlists(container: Container) -> PlaylistsResponse:
+    """Live, read-only listing of each connected platform's own playlists."""
+    # Serialized with sync/apply: providers share token caches with those runs.
+    with container.sync_lock:
+        listing = container.playlist_service.list_playlists(skip_unavailable=True)
+    errors = {**container.playlist_gating, **listing.skipped}
+    platforms = [
+        PlatformPlaylists(
+            platform=platform,
+            playlists=[
+                PlaylistInfo(name=s.name, track_count=s.track_count)
+                for s in listing.playlists.get(platform, [])
+            ],
+            error=errors.get(platform),
+        )
+        for platform in PLATFORMS
+        if platform in listing.playlists or platform in errors
+    ]
+    return PlaylistsResponse(platforms=platforms)
+
+
+def preview_playlists(
+    container: Container, body: PlaylistPreviewRequest
+) -> PlaylistPreview:
+    """Dry-run mirror diff for the named playlists: reads + DB upsert, zero writes."""
+    options = PlaylistSyncOptions(
+        names=tuple(body.names), dry_run=True, skip_unavailable_providers=True
+    )
+    with container.sync_lock:
+        result = container.playlist_service.run(options)
+    items = [
+        PlaylistPreviewItem(
+            name=diff.name,
+            to_add={p: _track_rows(t) for p, t in diff.to_add.items()},
+            counts={p: len(t) for p, t in diff.to_add.items()},
+        )
+        for diff in result.diffs.values()
+    ]
+    return PlaylistPreview(
+        playlists=items,
+        skipped={**container.playlist_gating, **result.skipped},
+        missing=result.missing_names,
+        ambiguous=result.ambiguous,
+    )
+
+
 def export_csv_endpoint(container: Container) -> StreamingResponse:
     rows = container.repo.iter_export_rows()
     buf = io.StringIO()
@@ -370,6 +460,7 @@ def export_csv_endpoint(container: Container) -> StreamingResponse:
 def create_app(
     db_path: Path | None = None,
     providers: list[LibraryProvider] | None = None,
+    playlist_providers: list[PlaylistProvider] | None = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application.
 
@@ -381,8 +472,12 @@ def create_app(
     providers:
         Optional provider list override.  Pass mock providers in tests to avoid
         requiring .env credentials.  Defaults to the real providers built from .env.
+    playlist_providers:
+        Optional read-only playlist provider override (tests inject fakes).
     """
-    container = build_container(db_path, providers=providers)
+    container = build_container(
+        db_path, providers=providers, playlist_providers=playlist_providers
+    )
 
     app = FastAPI(title="music-sync API", version="0.2.0")
 
@@ -470,6 +565,26 @@ def create_app(
         body: Annotated[ApplyRequest, Body()] = ApplyRequest(),
     ) -> ApplyResult:
         return apply_platform(container, platform, reorder=body.reorder)
+
+    # Live platform reads (AppleScript + OAuth APIs): guarded like the POSTs so a
+    # cross-origin page cannot trigger them.
+    @app.get(
+        "/api/playlists",
+        response_model=PlaylistsResponse,
+        dependencies=[Depends(require_xhr_header)],
+    )
+    def _playlists() -> PlaylistsResponse:
+        return get_playlists(container)
+
+    @app.post(
+        "/api/playlists/preview",
+        response_model=PlaylistPreview,
+        dependencies=[Depends(require_xhr_header)],
+    )
+    def _playlists_preview(
+        body: Annotated[PlaylistPreviewRequest, Body()],
+    ) -> PlaylistPreview:
+        return preview_playlists(container, body)
 
     @app.get("/api/export.csv")
     def _export_csv() -> StreamingResponse:

@@ -1,6 +1,6 @@
 # Sprint 4 plan — playlist mirroring
 
-**Status:** planned, not started. Follows Sprint 2 (web app + metadata). Net-new capability:
+**Status:** shipped (REDUCE scope — see `docs/handoff/post-sprint-4.md`). Follows Sprint 2 (web app + metadata). Net-new capability:
 today the tool reconciles only **liked/favorite songs**; there is **no playlist code at all**
 (playlists were a Sprint-2 stretch goal, deferred). This sprint adds reading playlists and
 mirroring them across platforms.

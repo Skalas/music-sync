@@ -23,10 +23,17 @@ from musicsync.application.output_paths import (
     TO_APPLE_PATH,
     UNMATCHED_LOG_PATH,
 )
+from musicsync.application.playlist_sync_service import PlaylistSyncService
 from musicsync.application.sync_service import SyncService
-from musicsync.domain.ports import LibraryProvider
-from musicsync.infrastructure.providers import build_providers
-from musicsync.infrastructure.spotify_provider import SpotifyProvider
+from musicsync.domain.platforms import PLATFORMS
+from musicsync.domain.ports import LibraryProvider, PlaylistProvider
+from musicsync.infrastructure.providers import build_playlist_providers, build_providers
+from musicsync.infrastructure.spotify_provider import (
+    PlaylistScope,
+    SpotifyProvider,
+    cached_token_scopes,
+    playlist_scopes,
+)
 from musicsync.infrastructure.sqlite_repository import SqliteTrackRepository
 from musicsync.infrastructure.tidal_provider import TidalProvider
 
@@ -73,6 +80,9 @@ class Container:
     repo: SqliteTrackRepository
     providers: list[LibraryProvider]
     sync_service: SyncService
+    playlist_service: PlaylistSyncService
+    playlist_gating: dict[str, str] = field(default_factory=dict)
+    """{platform: reason} for connected platforms left out of playlist reads."""
     # Serializes whole SyncService.run sequences across concurrent web threads
     # (post_sync, the SSE executor, apply_platform).
     sync_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -82,13 +92,17 @@ def _build_providers(
     *,
     need_write_spotify: bool = False,
     need_write_tidal: bool = False,
+    interactive: bool = False,
 ) -> list[LibraryProvider]:
     """Construct only providers whose platform is actually CONNECTED.
 
     The web app must read only platforms that are set up, so unconnected
-    platforms are never built — live sync then never touches them and never
-    triggers an interactive OAuth/browser popup.  skip_on_error=True remains a
-    belt-and-suspenders guard for any construction-time failure.
+    platforms are never built — live sync then never touches them.  Read paths
+    keep *interactive* False: an expired/unrefreshable token raises (and the
+    platform is skipped) instead of opening a browser OAuth inside a request.
+    Only the explicit Apply click passes True.
+    skip_on_error=True remains a belt-and-suspenders guard for any
+    construction-time failure.
     """
     connected = {p: all(connection_status(p, BASE_DIR)) for p in ("spotify", "apple", "tidal")}
     return build_providers(
@@ -103,13 +117,50 @@ def _build_providers(
         include_spotify=connected["spotify"],
         include_apple=connected["apple"],
         include_tidal=connected["tidal"],
+        interactive=interactive,
     )
+
+
+SPOTIFY_PLAYLIST_SCOPE_MISSING = (
+    "Spotify token lacks playlist access; run `uv run python sync_music.py "
+    "--list-playlists` once to re-authorize."
+)
+
+
+def _build_playlist_providers() -> tuple[list[PlaylistProvider], dict[str, str]]:
+    """Read-only playlist providers for CONNECTED platforms, plus gating notes.
+
+    Spotify joins only when its cached token already carries every playlist read
+    scope: building it otherwise would pop an interactive OAuth from the server.
+    """
+    connected = {p: all(connection_status(p, BASE_DIR)) for p in PLATFORMS}
+    gating: dict[str, str] = {}
+    read_scopes = set(playlist_scopes(PlaylistScope.READ))
+    if connected["spotify"] and not read_scopes <= cached_token_scopes(BASE_DIR):
+        connected["spotify"] = False
+        gating["spotify"] = SPOTIFY_PLAYLIST_SCOPE_MISSING
+    providers = build_playlist_providers(
+        BASE_DIR,
+        applescript_dir=APPLESCRIPT_DIR,
+        output_path=TO_APPLE_PATH,
+        unmatched_log_path=UNMATCHED_LOG_PATH,
+        include_spotify=connected["spotify"],
+        include_apple=connected["apple"],
+        include_tidal=connected["tidal"],
+        skip_on_error=True,
+        interactive=False,
+    )
+    return providers, gating
 
 
 def _upgrade_write_scope(
     providers: list[LibraryProvider], platform: str
 ) -> list[LibraryProvider]:
-    """Swap the apply target for a write-scoped OAuth instance when applicable."""
+    """Swap the apply target for a write-scoped OAuth instance when applicable.
+
+    Interactive on purpose: Apply is an explicit click on the user's own machine,
+    so a missing write grant may open the browser consent (unlike read paths).
+    """
     upgraded: list[LibraryProvider] = []
     for provider in providers:
         if provider.name != platform:
@@ -143,6 +194,7 @@ def build_sync_service_for_apply(container: Container, platform: str) -> SyncSer
         providers = _build_providers(
             need_write_spotify=(platform == "spotify"),
             need_write_tidal=(platform == "tidal"),
+            interactive=True,
         )
     return SyncService(container.repo, providers, state_json_path=STATE_PATH)
 
@@ -150,6 +202,7 @@ def build_sync_service_for_apply(container: Container, platform: str) -> SyncSer
 def build_container(
     db_path: Path | None = None,
     providers: list[LibraryProvider] | None = None,
+    playlist_providers: list[PlaylistProvider] | None = None,
 ) -> Container:
     """Build the full application container.
 
@@ -161,6 +214,9 @@ def build_container(
     providers:
         Override the provider list entirely.  Pass an empty list or mock
         providers to avoid touching .env / network during tests.
+    playlist_providers:
+        Override the (read-only) playlist providers.  Defaults to an empty list
+        when *providers* is overridden, so tests never build real ones.
     """
     # Populate the process env once so any os.environ reader sees the .env creds.
     load_dotenv(BASE_DIR / ".env")
@@ -168,13 +224,23 @@ def build_container(
     resolved_db = db_path or DEFAULT_DB
     repo = SqliteTrackRepository(resolved_db)
 
+    providers_overridden = providers is not None
     if providers is None:
         providers = _build_providers()
 
     service = SyncService(repo, providers, state_json_path=STATE_PATH)
 
+    gating: dict[str, str] = {}
+    if playlist_providers is None:
+        playlist_providers, gating = (
+            ([], {}) if providers_overridden else _build_playlist_providers()
+        )
+
     return Container(
         repo=repo,
         providers=providers,
         sync_service=service,
+        # Web is read-only for playlists (dry-run preview): no review file.
+        playlist_service=PlaylistSyncService(repo, playlist_providers),
+        playlist_gating=gating,
     )

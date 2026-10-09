@@ -11,6 +11,7 @@ from pathlib import Path
 from musicsync.domain._time import utc_now_iso
 from musicsync.domain.apple_catalog import AppleLinkTarget
 from musicsync.domain.platforms import PLATFORMS
+from musicsync.domain.playlist import Playlist, normalize_playlist_name
 from musicsync.domain.track import Track, normalize_key
 from musicsync.domain.union import canonicalize_presence
 
@@ -44,6 +45,24 @@ CREATE TABLE IF NOT EXISTS apple_catalog (
     resolved_at TEXT NOT NULL,
     FOREIGN KEY (key) REFERENCES tracks(key)
 );
+CREATE TABLE IF NOT EXISTS playlists (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL,
+    name TEXT NOT NULL,
+    name_key TEXT NOT NULL,
+    remote_id TEXT,
+    UNIQUE (platform, name_key)
+);
+CREATE TABLE IF NOT EXISTS playlist_tracks (
+    playlist_id INTEGER NOT NULL,
+    track_key TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    artist TEXT NOT NULL DEFAULT '',
+    present INTEGER NOT NULL DEFAULT 0,
+    synced_at TEXT,
+    PRIMARY KEY (playlist_id, track_key),
+    FOREIGN KEY (playlist_id) REFERENCES playlists(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS _meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -73,6 +92,11 @@ _METADATA_COLUMNS = ("album", "artwork_url", "duration_sec", "year")
 def _metadata_from_row(row: sqlite3.Row) -> dict[str, str | int | None]:
     """Extract the four track-level metadata fields from a query row."""
     return {col: row[col] for col in _METADATA_COLUMNS}
+
+
+def _placeholders(values: list[str]) -> str:
+    """``?, ?, ?`` for an IN clause (values stay bound parameters, never inlined)."""
+    return ", ".join("?" for _ in values)
 
 
 class DatabaseError(Exception):
@@ -590,4 +614,152 @@ class SqliteTrackRepository:
                 """,
                 (key, catalog_id, storefront, resolved_at, key),
             )
+            self._conn.commit()
+
+    # -- playlists -----------------------------------------------------------
+
+    def _ensure_playlist_row(
+        self, platform: str, name: str, remote_id: str | None
+    ) -> int:
+        """Upsert the (platform, name) row and return its id. Caller holds the lock.
+
+        A different non-null *remote_id* means a different remote playlist (the old
+        one was deleted/renamed): its stored membership and mirror state are stale
+        and are dropped so they cannot suppress adds into the new one.
+        """
+        name_key = normalize_playlist_name(name)
+        previous = self._conn.execute(
+            "SELECT id, remote_id FROM playlists WHERE platform = ? AND name_key = ?",
+            (platform, name_key),
+        ).fetchone()
+        if (
+            previous is not None
+            and remote_id is not None
+            and previous["remote_id"] not in (None, remote_id)
+        ):
+            self._conn.execute(
+                "DELETE FROM playlist_tracks WHERE playlist_id = ?", (previous["id"],)
+            )
+        self._conn.execute(
+            """
+            INSERT INTO playlists (platform, name, name_key, remote_id)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(platform, name_key) DO UPDATE SET
+                name = excluded.name,
+                remote_id = COALESCE(excluded.remote_id, remote_id)
+            """,
+            (platform, name, name_key, remote_id),
+        )
+        row = self._conn.execute(
+            "SELECT id FROM playlists WHERE platform = ? AND name_key = ?",
+            (platform, name_key),
+        ).fetchone()
+        return int(row["id"])
+
+    def upsert_playlist(self, playlist: Playlist) -> None:
+        """Replace the playlist's observed membership; mirror state (synced_at) survives."""
+        with self._lock:
+            playlist_id = self._ensure_playlist_row(
+                playlist.platform, playlist.name, playlist.remote_id
+            )
+            self._conn.execute(
+                "UPDATE playlist_tracks SET present = 0 WHERE playlist_id = ?",
+                (playlist_id,),
+            )
+            for track in playlist.tracks:
+                self._conn.execute(
+                    """
+                    INSERT INTO playlist_tracks
+                        (playlist_id, track_key, name, artist, present)
+                    VALUES (?, ?, ?, ?, 1)
+                    ON CONFLICT(playlist_id, track_key) DO UPDATE SET
+                        name = excluded.name,
+                        artist = excluded.artist,
+                        present = 1
+                    """,
+                    (playlist_id, track.key, track.name, track.artist),
+                )
+            self._conn.execute(
+                """
+                DELETE FROM playlist_tracks
+                WHERE playlist_id = ? AND present = 0 AND synced_at IS NULL
+                """,
+                (playlist_id,),
+            )
+            self._conn.commit()
+
+    def get_playlists(self, name_keys: set[str]) -> dict[str, list[Playlist]]:
+        """{platform: [Playlist]} with only the tracks observed in the last read."""
+        keys = sorted(name_keys)
+        result: dict[str, list[Playlist]] = {}
+        with self._lock:
+            playlist_rows = self._conn.execute(
+                "SELECT id, platform, name, remote_id FROM playlists "
+                f"WHERE name_key IN ({_placeholders(keys)}) ORDER BY platform, id",
+                keys,
+            ).fetchall()
+            for row in playlist_rows:
+                track_rows = self._conn.execute(
+                    """
+                    SELECT name, artist FROM playlist_tracks
+                    WHERE playlist_id = ? AND present = 1
+                    ORDER BY rowid
+                    """,
+                    (row["id"],),
+                ).fetchall()
+                result.setdefault(row["platform"], []).append(
+                    Playlist(
+                        platform=row["platform"],
+                        name=row["name"],
+                        remote_id=row["remote_id"],
+                        tracks=tuple(
+                            Track(name=t["name"], artist=t["artist"]) for t in track_rows
+                        ),
+                    )
+                )
+        return result
+
+    def get_playlist_synced_keys(
+        self, name_keys: set[str]
+    ) -> dict[str, dict[str, set[str]]]:
+        keys = sorted(name_keys)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT p.name_key, p.platform, pt.track_key
+                FROM playlist_tracks pt
+                JOIN playlists p ON p.id = pt.playlist_id
+                WHERE pt.synced_at IS NOT NULL
+                  AND p.name_key IN ({_placeholders(keys)})
+                """,
+                keys,
+            ).fetchall()
+        result: dict[str, dict[str, set[str]]] = {}
+        for row in rows:
+            by_platform = result.setdefault(row["name_key"], {})
+            by_platform.setdefault(row["platform"], set()).add(row["track_key"])
+        return result
+
+    def mark_playlist_synced(
+        self,
+        platform: str,
+        name: str,
+        remote_id: str | None,
+        tracks: list[Track],
+        *,
+        when: str,
+    ) -> None:
+        with self._lock:
+            playlist_id = self._ensure_playlist_row(platform, name, remote_id)
+            for track in tracks:
+                self._conn.execute(
+                    """
+                    INSERT INTO playlist_tracks
+                        (playlist_id, track_key, name, artist, present, synced_at)
+                    VALUES (?, ?, ?, ?, 0, ?)
+                    ON CONFLICT(playlist_id, track_key) DO UPDATE SET
+                        synced_at = excluded.synced_at
+                    """,
+                    (playlist_id, track.key, track.name, track.artist, when),
+                )
             self._conn.commit()

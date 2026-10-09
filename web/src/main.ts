@@ -2,16 +2,18 @@ import "./style.css";
 import { renderConnections } from "./views/connections.js";
 import { renderLibrary } from "./views/library.js";
 import { renderActions } from "./views/actions.js";
+import { renderPlaylists } from "./views/playlists.js";
 
 // ---------------------------------------------------------------------------
 // DOM scaffold
 // ---------------------------------------------------------------------------
 
-type ViewId = "connections" | "library" | "actions";
+type ViewId = "connections" | "library" | "playlists" | "actions";
 
 const VIEWS: { id: ViewId; label: string }[] = [
   { id: "connections", label: "Connections" },
   { id: "library", label: "Library" },
+  { id: "playlists", label: "Playlists" },
   { id: "actions", label: "Actions" },
 ];
 
@@ -68,6 +70,9 @@ function navigate(
       break;
     case "library":
       renderLibrary(main);
+      break;
+    case "playlists":
+      void renderPlaylists(main);
       break;
     case "actions":
       renderActions(main);
