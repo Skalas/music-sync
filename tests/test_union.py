@@ -178,3 +178,15 @@ def test_dedupe_title_only_keys_merges_db_rows(tmp_path: Path) -> None:
     assert rows[0]["spotify"] == 1
     assert rows[0]["tidal"] == 1
     repo.close()
+
+
+def test_union_queues_oldest_liked_first_not_alphabetical() -> None:
+    newest = Track(name="Aaa", artist="Band", added_at="2024-06-01")
+    oldest = Track(name="Zzz", artist="Band", added_at="2019-01-01")
+    undated = Track(name="Mmm", artist="Band")
+    presence = {
+        "spotify": {t.key: t for t in (newest, oldest, undated)},
+        "apple": {},
+    }
+    result = compute_to_sync(presence, {"spotify": set(), "apple": set()})
+    assert [t.name for t in result["apple"]] == ["Mmm", "Zzz", "Aaa"]

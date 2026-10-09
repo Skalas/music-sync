@@ -119,6 +119,9 @@ def compute_to_sync(
 ) -> dict[str, list[Track]]:
     """Return per-platform tracks to push: liked elsewhere but absent and not synced.
 
+    Each list is oldest-liked first, so applying it in order leaves the newest
+    likes as the most recent additions on the target (key order breaks ties).
+
     For each target platform, a track is queued when it is liked on *any* other
     connected platform, is not already liked on the target, and has not been
     recorded as synced to the target.
@@ -148,13 +151,13 @@ def compute_to_sync(
                 if key in source_tracks:
                     tracks_out.append(source_tracks[key])
                     break
-        result[target] = tracks_out
+        result[target] = sort_tracks_chronologically(tracks_out)
 
     return result
 
 
 def sort_tracks_chronologically(tracks: list[Track]) -> list[Track]:
-    """Oldest liked first — when applied to Tidal (prepend-newest UI), newest ends on top."""
+    """Oldest liked first, so newest-on-top targets (Tidal, Apple favorites) end newest first."""
     return sorted(tracks, key=lambda t: t.added_at or "")
 
 
