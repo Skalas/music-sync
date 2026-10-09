@@ -3,6 +3,21 @@
 All notable changes to this project are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] — Sprint 4: playlist mirroring
+
+### Added
+- **Playlist mirroring Spotify ⇄ Apple Music** (additive, opt-in per playlist):
+  `--mirror-playlist NAME` (repeatable), writes only with `--apply-spotify` / `--apply-apple`;
+  review file `playlists_review.txt`. `--list-playlists`. See `docs/handoff/post-sprint-4.md`.
+- `playlists` / `playlist_tracks` tables; AppleScripts `read_playlists`, `read_playlist_tracks`,
+  `add_to_playlist`; Spotify playlist scopes.
+- Web: `GET /api/playlists`, `POST /api/playlists/preview`, read-only Playlists view.
+
+### Fixed
+- Tidal liked-songs read failing with HTTP 400 (top-level `artists` include no longer accepted).
+- Spotify scope requests never narrow an existing grant (no re-authorization ping-pong).
+- Web read paths never start an interactive OAuth flow.
+
 ## [Unreleased] — Sprint 5: real Apple Music track links
 
 ### Added

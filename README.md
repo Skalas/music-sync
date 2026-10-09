@@ -215,11 +215,19 @@ permisos de Automatización (Música). Las siguientes son silenciosas e incremen
 | `--no-apple` | No procesa la dirección hacia Apple Music. |
 | `--no-spotify` | No procesa la dirección hacia Spotify. |
 | `--no-tidal` | Excluye Tidal por completo de la unión. |
+| `--list-playlists` | Lista tus playlists propias, una por línea: `plataforma<TAB>nombre<TAB>canciones`, y termina. |
+| `--mirror-playlist "Nombre"` | Refleja esa playlist (por nombre, sin distinguir mayúsculas) entre plataformas; repetible. Solo agrega, nunca borra. Sin `--apply-spotify` / `--apply-apple` no escribe: deja los pendientes en `playlists_review.txt`. |
+
+**Playlists:** la primera vez que uses `--list-playlists` o `--mirror-playlist`, Spotify vuelve a pedir
+autorización en el navegador (scopes `playlist-read-private` y `playlist-read-collaborative`; con `--apply-spotify` también
+`playlist-modify-*`). En Apple solo se agregan canciones que ya están en tu biblioteca; el resto va a
+`playlists_review.txt`. Las playlists de Tidal son solo lectura (fuente, nunca destino).
 
 **Base de datos (`library.db`, fuente de verdad):**
 - Tabla `tracks` (una fila por canción normalizada, con ISRC cuando la plataforma lo da), `presence`
   (qué plataformas la tienen marcada y cuándo se sincronizó) y `apple_catalog` (id de catálogo de
-  Apple por canción; `NULL` = no encontrada). Sustituye a `state.json`, que se **migra automáticamente** una sola vez.
+  Apple por canción; `NULL` = no encontrada), más `playlists` y `playlist_tracks` (membresía de las
+  playlists reflejadas y qué se agregó). Sustituye a `state.json`, que se **migra automáticamente** una sola vez.
 - Inspecciónala con cualquier cliente SQLite, o expórtala con `--export`.
 
 **Archivos generados (ignorados por git, anclados a la raíz del proyecto — no al directorio
@@ -229,6 +237,7 @@ desde el que ejecutes):**
   que faltan importar del catálogo (las que ya estaban en la biblioteca no pasan por el Atajo).
 - `to_spotify_review.txt` — candidatos a agregar en Spotify, para revisar.
 - `unmatched.log` — canciones sin match cross-service.
+- `playlists_review.txt` — pendientes / sin match de `--mirror-playlist`.
 - `.tidal-cache` — token OAuth de Tidal (escrito de forma atómica con permisos `0600`).
 
 ---
