@@ -3,6 +3,7 @@
 .venv/
 .cache
 .tidal-cache
+*.p8
 
 # Estado y artefactos generados en runtime
 state.json
