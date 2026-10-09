@@ -6,6 +6,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from musicsync.domain.playlist import Playlist, PlaylistAddResult, PlaylistSummary
 from musicsync.domain.track import Track
 
 
@@ -98,4 +99,73 @@ class TrackRepository(Protocol):
 
     def dedupe_title_only_keys(self) -> int:
         """Merge title-only keys into canonical keys with the same normalized title."""
+        ...
+
+
+@runtime_checkable
+class PlaylistProvider(Protocol):
+    """Read and (optionally) additively write user playlists on a platform.
+
+    Capability flags let the application skip a platform without checking its
+    name: ``can_playlist_read`` gates listing/reading, ``can_playlist_write``
+    gates being a mirror target.
+    """
+
+    name: str
+    can_playlist_read: bool
+    can_playlist_write: bool
+    reserved_playlist_names: frozenset[str]
+    """Normalized names of the platform's system playlists: a wanted name in it
+    is ambiguous there (never read, written, or created as a user playlist)."""
+
+    def list_playlists(self) -> list[PlaylistSummary]:
+        """Return the user's plain playlists (no smart/system ones).
+
+        Followed/others' playlists may be included with ``owned=False`` so the
+        application can detect a name clash; they are never read or written.
+        """
+        ...
+
+    def read_playlist(self, summary: PlaylistSummary) -> Playlist:
+        """Return *summary*'s playlist with its tracks."""
+        ...
+
+    def add_to_playlist(
+        self, name: str, remote_id: str | None, tracks: list[Track]
+    ) -> PlaylistAddResult:
+        """Add *tracks* to playlist *name* (created when *remote_id* is None).
+
+        Additive only: never removes, never duplicates a track already there.
+        """
+        ...
+
+
+@runtime_checkable
+class PlaylistRepository(Protocol):
+    """SQLite-backed playlist membership and mirror state."""
+
+    def upsert_playlist(self, playlist: Playlist) -> None:
+        """Idempotently record *playlist* and the tracks currently in it."""
+        ...
+
+    def get_playlists(self, name_keys: set[str]) -> dict[str, list[Playlist]]:
+        """Return ``{platform: [Playlist]}`` for the given normalized names."""
+        ...
+
+    def get_playlist_synced_keys(
+        self, name_keys: set[str]
+    ) -> dict[str, dict[str, set[str]]]:
+        """Return ``{name_key: {platform: track_keys already mirrored there}}``."""
+        ...
+
+    def mark_playlist_synced(
+        self,
+        platform: str,
+        name: str,
+        remote_id: str | None,
+        tracks: list[Track],
+        *,
+        when: str,
+    ) -> None:
+        """Record that *tracks* were mirrored into *platform*'s playlist *name*."""
         ...
