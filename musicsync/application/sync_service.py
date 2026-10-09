@@ -17,7 +17,6 @@ from musicsync.domain.union import (
     compute_tidal_catalog,
     compute_to_sync,
     remap_synced_keys,
-    sort_tracks_chronologically,
 )
 
 logger = logging.getLogger(__name__)
@@ -159,8 +158,6 @@ class SyncService:
                         "Tidal reorder: catálogo completo con %d pista(s)",
                         len(tracks),
                     )
-                else:
-                    tracks = sort_tracks_chronologically(tracks)
 
             if not tracks:
                 if plan.apply_flag:
