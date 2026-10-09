@@ -14,11 +14,18 @@ from __future__ import annotations
 
 import subprocess
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from musicsync.domain.errors import PlatformOperationError
+from musicsync.domain.playlist import (
+    Playlist,
+    PlaylistAddResult,
+    PlaylistSummary,
+    normalize_playlist_name,
+)
 from musicsync.domain.track import Track, primary_artist, year_from_date
 
 SHORTCUT_NAME = "SyncToAppleMusic"
@@ -27,6 +34,83 @@ _TAB = "\t"
 # Per-line statuses reported by mark_loved.applescript.
 _STATUS_FAVORITED = "OK"
 _STATUS_MISSING = "MISSING"
+
+# Per-line statuses reported by add_to_playlist.applescript (+ its trailer tag).
+_STATUS_ADDED = "ADDED"
+_STATUS_PRESENT = "PRESENT"
+_PLAYLIST_TRAILER = "PLAYLIST"
+# 4th field of read_playlists.applescript for smart/folder/special playlists.
+_NOT_EDITABLE = "0"
+
+# Automatic playlists some macOS versions expose as plain user playlists.
+SYSTEM_PLAYLIST_NAMES = frozenset(
+    normalize_playlist_name(name)
+    for name in (
+        "Library",
+        "Music",
+        "Music Videos",
+        "Movies",
+        "TV Shows",
+        "Podcasts",
+        "Audiobooks",
+        "Purchased",
+        "Purchased Music",
+        "Genius",
+        "Favourite Songs",
+        "Favorite Songs",
+        "Recently Added",
+        "Recently Played",
+        "Top 25 Most Played",
+        "My Top Rated",
+        "Downloaded",
+        "Downloaded Music",
+    )
+)
+
+
+def _parse_playlist_line(line: str) -> PlaylistSummary | None:
+    """``persistent_id TAB name TAB count [TAB editable]`` → summary.
+
+    ``editable`` 0 (smart playlist, folder, special kind) → ``owned=False``: never
+    read or written, but its name still blocks creating a same-named copy. A
+    legacy 3-field line counts as editable. None for system/garbled lines.
+    """
+    parts = line.split(_TAB)
+    if len(parts) < 3 or not parts[0].strip() or not parts[1].strip():
+        return None
+    name = parts[1].strip()
+    if normalize_playlist_name(name) in SYSTEM_PLAYLIST_NAMES:
+        return None
+    count = parts[2].strip()
+    return PlaylistSummary(
+        platform="apple",
+        name=name,
+        remote_id=parts[0].strip(),
+        track_count=int(count) if count.isdigit() else 0,
+        owned=len(parts) < 4 or parts[3].strip() != _NOT_EDITABLE,
+    )
+
+
+def _parse_add_report(
+    tracks: list[Track], stdout: str, remote_id: str | None
+) -> PlaylistAddResult:
+    """Pair add_to_playlist's status lines with *tracks* positionally (see mark_loved)."""
+    statuses: list[str] = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        tag, _, rest = line.partition(_TAB)
+        if tag.strip() == _PLAYLIST_TRAILER:
+            remote_id = rest.strip() or remote_id
+        else:
+            statuses.append(tag.strip())
+    added: list[Track] = []
+    unresolved: list[Track] = []
+    for index, track in enumerate(tracks):
+        status = statuses[index] if index < len(statuses) else ""
+        landed = status in (_STATUS_ADDED, _STATUS_PRESENT)
+        (added if landed else unresolved).append(track)
+    return PlaylistAddResult(remote_id=remote_id, added=added, unresolved=unresolved)
 
 
 def _parse_apple_line(line: str) -> Track | None:
@@ -85,6 +169,20 @@ def _search_line(track: Track) -> str:
     return f"{_tsv_field(track.name)} - {_tsv_field(artist)}"
 
 
+@contextmanager
+def _temp_tsv(payload: str) -> Iterator[Path]:
+    """A temporary UTF-8 TSV input file for a script, removed afterwards."""
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".tsv", encoding="utf-8", delete=False
+    ) as handle:
+        handle.write(payload)
+        tsv_path = Path(handle.name)
+    try:
+        yield tsv_path
+    finally:
+        tsv_path.unlink(missing_ok=True)
+
+
 @dataclass(frozen=True)
 class _FavoriteOutcome:
     """How one favorite pass resolved, partitioned by what to do next."""
@@ -129,6 +227,9 @@ class AppleProvider:
     name = "apple"
     can_write = True
     graceful_on_error = False
+    can_playlist_read = True
+    can_playlist_write = True
+    reserved_playlist_names = SYSTEM_PLAYLIST_NAMES
 
     def __init__(
         self,
@@ -139,11 +240,12 @@ class AppleProvider:
         self._applescript_dir = applescript_dir
         self._output_path = output_path
 
-    def read_liked(self) -> list[Track]:
-        script = self._applescript_dir / "read_loved.applescript"
+    def _run_script(self, script_name: str, *args: str) -> str:
+        """Run one applescript/ script and return its stdout."""
+        script = self._applescript_dir / script_name
         try:
             result = subprocess.run(
-                ["osascript", str(script)],
+                ["osascript", str(script), *args],
                 capture_output=True,
                 text=True,
                 check=True,
@@ -154,11 +256,14 @@ class AppleProvider:
             ) from exc
         except subprocess.CalledProcessError as exc:
             raise PlatformOperationError(
-                f"error leyendo Apple Music:\n{exc.stderr.strip()}"
+                f"error en Apple Music ({script_name}):\n{exc.stderr.strip()}"
             ) from exc
+        return result.stdout
 
+    @staticmethod
+    def _parse_tracks(stdout: str) -> list[Track]:
         tracks: list[Track] = []
-        for line in result.stdout.splitlines():
+        for line in stdout.splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -166,6 +271,47 @@ class AppleProvider:
             if track is not None:
                 tracks.append(track)
         return tracks
+
+    def read_liked(self) -> list[Track]:
+        return self._parse_tracks(self._run_script("read_loved.applescript"))
+
+    # -- playlists -----------------------------------------------------------
+
+    def list_playlists(self) -> list[PlaylistSummary]:
+        stdout = self._run_script("read_playlists.applescript")
+        parsed = (_parse_playlist_line(line) for line in stdout.splitlines())
+        return [summary for summary in parsed if summary is not None]
+
+    def read_playlist(self, summary: PlaylistSummary) -> Playlist:
+        stdout = self._run_script(
+            "read_playlist_tracks.applescript", summary.remote_id or ""
+        )
+        return Playlist(
+            platform=self.name,
+            name=summary.name,
+            remote_id=summary.remote_id,
+            tracks=tuple(self._parse_tracks(stdout)),
+        )
+
+    def add_to_playlist(
+        self, name: str, remote_id: str | None, tracks: list[Track]
+    ) -> PlaylistAddResult:
+        """Add library tracks to *name*; catalog-only tracks come back unresolved.
+
+        AppleScript cannot pull songs from the Apple Music catalog, so a track
+        not already in the library is reported, never imported.
+        """
+        if not tracks:
+            return PlaylistAddResult(remote_id=remote_id)
+        payload = "".join(
+            f"{_tsv_field(t.name)}{_TAB}{_tsv_field(primary_artist(t.artist))}\n"
+            for t in tracks
+        )
+        with _temp_tsv(payload) as tsv_path:
+            stdout = self._run_script(
+                "add_to_playlist.applescript", str(tsv_path), name, remote_id or ""
+            )
+        return _parse_add_report(tracks, stdout, remote_id)
 
     def apply_likes(
         self,
@@ -239,24 +385,17 @@ class AppleProvider:
         payload = "".join(
             f"{_tsv_field(t.name)}{_TAB}{_tsv_field(t.artist)}\n" for t in tracks
         )
-        with tempfile.NamedTemporaryFile(
-            "w", suffix=".tsv", encoding="utf-8", delete=False
-        ) as handle:
-            handle.write(payload)
-            tsv_path = Path(handle.name)
-
-        try:
-            result = subprocess.run(
-                ["osascript", str(script), str(tsv_path)],
-                capture_output=True,
-                text=True,
-            )
-        except FileNotFoundError as exc:
-            raise PlatformOperationError(
-                "'osascript' no está disponible (¿estás en macOS?)."
-            ) from exc
-        finally:
-            tsv_path.unlink(missing_ok=True)
+        with _temp_tsv(payload) as tsv_path:
+            try:
+                result = subprocess.run(
+                    ["osascript", str(script), str(tsv_path)],
+                    capture_output=True,
+                    text=True,
+                )
+            except FileNotFoundError as exc:
+                raise PlatformOperationError(
+                    "'osascript' no está disponible (¿estás en macOS?)."
+                ) from exc
 
         if result.returncode != 0:
             raise PlatformOperationError(

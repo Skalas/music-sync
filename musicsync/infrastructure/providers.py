@@ -15,26 +15,34 @@ import logging
 from collections.abc import Callable
 from pathlib import Path
 
-from musicsync.domain.ports import LibraryProvider
+from musicsync.domain.ports import LibraryProvider, PlaylistProvider
 from musicsync.infrastructure.apple_provider import AppleProvider
-from musicsync.infrastructure.spotify_provider import SpotifyProvider
+from musicsync.infrastructure.spotify_provider import PlaylistScope, SpotifyProvider
 from musicsync.infrastructure.tidal_provider import TidalProvider
 
 logger = logging.getLogger(__name__)
 
 
 def _build_spotify(
-    base_dir: Path, need_write: bool, unmatched_log_path: Path
+    base_dir: Path,
+    need_write: bool,
+    unmatched_log_path: Path,
+    playlist_scope: PlaylistScope = PlaylistScope.NONE,
+    interactive: bool = True,
 ) -> SpotifyProvider:
     return SpotifyProvider(
         base_dir=base_dir,
         need_write=need_write,
         unmatched_log_path=unmatched_log_path,
+        playlist_scope=playlist_scope,
+        interactive=interactive,
     )
 
 
-def _build_tidal(base_dir: Path, need_write: bool) -> TidalProvider:
-    return TidalProvider(base_dir=base_dir, need_write=need_write)
+def _build_tidal(
+    base_dir: Path, need_write: bool, interactive: bool = True
+) -> TidalProvider:
+    return TidalProvider(base_dir=base_dir, need_write=need_write, interactive=interactive)
 
 
 def build_providers(
@@ -50,6 +58,8 @@ def build_providers(
     include_apple: bool = True,
     include_tidal: bool = True,
     skip_on_error: bool = False,
+    spotify_playlist_scope: PlaylistScope = PlaylistScope.NONE,
+    interactive: bool = True,
 ) -> list[LibraryProvider]:
     """Construct the Spotify, Apple and Tidal providers.
 
@@ -72,6 +82,11 @@ def build_providers(
         When True, a provider whose construction fails (including SystemExit
         from missing .env) is logged and skipped so the caller still boots with
         the remaining providers. When False, the error propagates (CLI behavior).
+    spotify_playlist_scope:
+        Playlist OAuth scope for Spotify; NONE keeps the liked-songs scopes only.
+    interactive:
+        False (web) → Spotify/Tidal never open a browser OAuth; an unusable
+        token raises the provider's error instead, which callers skip.
     """
     write_spotify = need_write if need_write_spotify is None else need_write_spotify
     write_tidal = need_write if need_write_tidal is None else need_write_tidal
@@ -90,7 +105,13 @@ def build_providers(
     if include_spotify:
         _add(
             "spotify",
-            lambda: _build_spotify(base_dir, write_spotify, unmatched_log_path),
+            lambda: _build_spotify(
+                base_dir,
+                write_spotify,
+                unmatched_log_path,
+                spotify_playlist_scope,
+                interactive,
+            ),
         )
     if include_apple:
         _add(
@@ -103,10 +124,45 @@ def build_providers(
     if include_tidal:
         _add(
             "tidal",
-            lambda: _build_tidal(base_dir, write_tidal),
+            lambda: _build_tidal(base_dir, write_tidal, interactive),
         )
 
     return providers
+
+
+def build_playlist_providers(
+    base_dir: Path,
+    *,
+    applescript_dir: Path,
+    output_path: Path,
+    unmatched_log_path: Path,
+    write_spotify: bool = False,
+    include_spotify: bool = True,
+    include_apple: bool = True,
+    include_tidal: bool = True,
+    skip_on_error: bool = False,
+    interactive: bool = True,
+) -> list[PlaylistProvider]:
+    """Providers for playlist mirroring: liked-songs scopes stay read-only.
+
+    Spotify gets the playlist READ scope, or WRITE only when *write_spotify*
+    (the caller's --apply-spotify).
+    """
+    providers = build_providers(
+        base_dir,
+        applescript_dir=applescript_dir,
+        output_path=output_path,
+        unmatched_log_path=unmatched_log_path,
+        include_spotify=include_spotify,
+        include_apple=include_apple,
+        include_tidal=include_tidal,
+        skip_on_error=skip_on_error,
+        interactive=interactive,
+        spotify_playlist_scope=(
+            PlaylistScope.WRITE if write_spotify else PlaylistScope.READ
+        ),
+    )
+    return [p for p in providers if isinstance(p, PlaylistProvider)]
 
 
 def build_connect_provider(

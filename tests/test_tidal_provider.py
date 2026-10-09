@@ -451,3 +451,49 @@ def test_tidal_reorder_deletes_then_adds(tidal_env: Path) -> None:
     assert session.post.call_count >= 1
     assert applied[0].name == "Older"
     assert applied[1].name == "Newer"
+
+
+def _empty_collection_page() -> dict[str, Any]:
+    return {"data": [], "included": [], "links": {}}
+
+
+def test_tidal_read_http400_include_is_nested_under_items(tidal_env: Path) -> None:
+    """Regression: a top-level ``include=artists`` makes Tidal answer HTTP 400."""
+    session = requests.Session()
+    session.get = MagicMock(  # type: ignore[method-assign]
+        return_value=MagicMock(status_code=200, json=_empty_collection_page)
+    )
+    provider = TidalProvider(base_dir=tidal_env, session=session)
+    provider._write_cache(_valid_token_cache())  # noqa: SLF001
+
+    provider.read_liked()
+
+    include = session.get.call_args.kwargs["params"]["include"]
+    paths = include.split(",")
+    assert all(path.startswith("items") for path in paths)
+    assert "items.artists" in paths
+
+
+def test_tidal_read_http400_surfaces_error_detail_without_token(
+    tidal_env: Path,
+) -> None:
+    body = {
+        "errors": [
+            {"code": "GENERIC_REQUEST_ERROR", "detail": "Invalid include path 'x'"}
+        ]
+    }
+    session = requests.Session()
+    session.get = MagicMock(  # type: ignore[method-assign]
+        return_value=MagicMock(status_code=400, json=lambda: body)
+    )
+    provider = TidalProvider(base_dir=tidal_env, session=session)
+    provider._write_cache(_valid_token_cache())  # noqa: SLF001
+
+    with pytest.raises(TidalError) as excinfo:
+        provider.read_liked()
+
+    message = str(excinfo.value)
+    assert excinfo.value.status_code == 400
+    assert "HTTP 400" in message
+    assert "Invalid include path 'x'" in message
+    assert "Bearer" not in message
